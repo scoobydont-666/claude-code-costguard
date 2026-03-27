@@ -19,7 +19,6 @@ intelligent model routing, subagent delegation, and real-time analytics.
 - All skills are sanitized copies — never reference Hydra, Christi, STR, or internal projects
 - budi is a third-party dependency, not included — only documented
 - costguard-pulse is a sanitized fork of hydra-pulse
-- Always use `127.0.0.1`, never `localhost`
 
 ## Build & Test
 ```bash
