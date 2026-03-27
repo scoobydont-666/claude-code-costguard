@@ -376,65 +376,59 @@ fn cmd_agents(conn: &Connection, session: &Option<String>) -> Result<()> {
     Ok(())
 }
 
-/// Get calibrated percentages with auto-reset at 5h window boundary.
+/// Snapshot-delta calibration model.
 ///
-/// The 5h window is rolling — when it resets, both tracked and actual start fresh,
-/// so the 5h offset should auto-zero. We predict the reset time from the last
-/// calibration and auto-zero when we cross it.
+/// At calibration time we store: actual% (from claude.ai) + our tracked tokens at that moment.
+/// Between calibrations, estimate: cal_actual + (current_tracked - tracked_at_cal) / budget * 100
 ///
-/// Weekly offset persists longer (decays over 24h) since the weekly window
-/// rolls more slowly and external usage (claude.ai web) accumulates.
-fn calibrated_pcts(conn: &Connection, tracked_week_pct: f64, tracked_5h_pct: f64) -> (f64, f64, bool) {
+/// 5h calibration expires after 5h (cal point rolls out of window).
+/// Weekly calibration expires after 24h.
+/// Returns (week_est, 5h_est, staleness_minutes, is_calibrated).
+fn calibrated_pcts(conn: &Connection, tracked_week_pct: f64, tracked_5h_pct: f64,
+                   week_tokens: i64, five_hr_tokens: i64, budget: &db::PlanBudget) -> (f64, f64, i64, bool) {
     let cal_ts = db::get_config(conn, "calibration_timestamp");
-    let cal_week_offset = db::get_config(conn, "calibration_weekly_offset")
-        .and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
-    let cal_5h_offset = db::get_config(conn, "calibration_5h_offset")
-        .and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
-    let five_hr_reset_at = db::get_config(conn, "five_hr_reset_at");
-
     let now = Utc::now();
 
-    // Check if calibration exists
     let cal_time = cal_ts.as_ref().and_then(|ts|
         chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S").ok()
     );
-    let is_calibrated = cal_time.map(|ct| {
-        let age_hours = (now.naive_utc() - ct).num_hours();
-        age_hours < 24  // Weekly offset valid for 24h
-    }).unwrap_or(false);
 
-    if !is_calibrated {
-        return (tracked_week_pct, tracked_5h_pct, false);
+    let staleness_mins = cal_time.map(|ct|
+        (now.naive_utc() - ct).num_minutes()
+    ).unwrap_or(9999);
+
+    if cal_time.is_none() {
+        return (tracked_week_pct, tracked_5h_pct, staleness_mins, false);
     }
 
-    // Check if 5h window has reset since last calibration
-    let five_hr_has_reset = five_hr_reset_at.as_ref().and_then(|ts|
-        chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S").ok()
-    ).map(|reset_time| now.naive_utc() > reset_time).unwrap_or(false);
-
-    // 5h offset: zero if window has reset, otherwise apply
-    let effective_5h_offset = if five_hr_has_reset {
-        // Window reset — tracked values are now accurate for THIS window
-        // Auto-zero the offset silently
-        db::set_config(conn, "calibration_5h_offset", "0.0").ok();
-        0.0
+    // 5h estimate: snapshot-delta if calibration is <5h old
+    let five_hr_est = if staleness_mins < 300 {
+        let cal_actual = db::get_config(conn, "cal_actual_5h_pct")
+            .and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+        let cal_tracked = db::get_config(conn, "cal_tracked_5h_tokens")
+            .and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+        let tracked_delta = (five_hr_tokens - cal_tracked).max(0);
+        let delta_pct = tracked_delta as f64 / budget.five_hr_tokens as f64 * 100.0;
+        (cal_actual + delta_pct).clamp(0.0, 100.0)
     } else {
-        cal_5h_offset
+        // Calibration rolled out of 5h window — tracked only
+        tracked_5h_pct
     };
 
-    // Weekly offset: decay linearly over 24h from calibration time
-    let weekly_age_hours = cal_time.map(|ct|
-        (now.naive_utc() - ct).num_minutes() as f64 / 60.0
-    ).unwrap_or(24.0);
-    let weekly_decay = (1.0 - weekly_age_hours / 24.0).max(0.0);
-    let effective_week_offset = cal_week_offset * weekly_decay;
+    // Weekly estimate: snapshot-delta if calibration is <24h old
+    let week_est = if staleness_mins < 1440 {
+        let cal_actual = db::get_config(conn, "cal_actual_weekly_pct")
+            .and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+        let cal_tracked = db::get_config(conn, "cal_tracked_weekly_tokens")
+            .and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+        let tracked_delta = (week_tokens - cal_tracked).max(0);
+        let delta_pct = tracked_delta as f64 / budget.weekly_tokens as f64 * 100.0;
+        (cal_actual + delta_pct).clamp(0.0, 100.0)
+    } else {
+        tracked_week_pct
+    };
 
-    let has_offset = effective_5h_offset.abs() > 0.1 || effective_week_offset.abs() > 0.1;
-
-    let adj_week = (tracked_week_pct + effective_week_offset).max(0.0).min(100.0);
-    let adj_5h = (tracked_5h_pct + effective_5h_offset).max(0.0).min(100.0);
-
-    (adj_week, adj_5h, has_offset || five_hr_has_reset)
+    (week_est, five_hr_est, staleness_mins, true)
 }
 
 fn cmd_statusline(conn: &Connection) -> Result<()> {
@@ -483,12 +477,24 @@ fn cmd_statusline(conn: &Connection) -> Result<()> {
     let week_pct = week_tokens as f64 / budget.weekly_tokens as f64 * 100.0;
     let five_hr_pct = five_hr_tokens as f64 / budget.five_hr_tokens as f64 * 100.0;
 
-    let (adj_week, adj_5h, is_cal) = calibrated_pcts(conn, week_pct, five_hr_pct);
+    let (wk, fh, stale_mins, _is_cal) = calibrated_pcts(conn, week_pct, five_hr_pct,
+        week_tokens, five_hr_tokens, &budget);
 
-    let (wk, fh) = if is_cal { (adj_week, adj_5h) } else { (week_pct, five_hr_pct) };
+    // Staleness indicator for 5h window (only when calibrated)
+    let stale_tag = if stale_mins >= 9999 {
+        String::new()
+    } else if stale_mins < 5 {
+        " ~".to_string()
+    } else if stale_mins < 60 {
+        format!(" ~{}m", stale_mins)
+    } else if stale_mins < 300 {
+        format!(" ~{}h{}m", stale_mins / 60, stale_mins % 60)
+    } else {
+        " ??".to_string()
+    };
 
     print!(
-        "wk {wk:.0}% ({}) | 5h {fh:.0}% | sess {} | {:.0}% cache",
+        "wk {wk:.0}% ({}) | 5h {fh:.0}%{stale_tag} | sess {} | {:.0}% cache",
         format_tokens(week_tokens),
         format_tokens(session_tokens),
         cache_hit,
@@ -803,7 +809,8 @@ fn main() -> Result<()> {
 
                 let week_pct = week_tokens as f64 / budget.weekly_tokens as f64 * 100.0;
                 let five_hr_pct = five_hr_tokens as f64 / budget.five_hr_tokens as f64 * 100.0;
-                let (adj_week, adj_5h, is_cal) = calibrated_pcts(&conn, week_pct, five_hr_pct);
+                let (adj_week, adj_5h, stale_mins, is_cal) = calibrated_pcts(&conn, week_pct, five_hr_pct,
+                    week_tokens, five_hr_tokens, &budget);
 
                 println!("{}", "  costguard-pulse budget".cyan().bold());
                 println!("  {}", "─".repeat(52).dimmed());
@@ -811,8 +818,14 @@ fn main() -> Result<()> {
                 if is_cal {
                     println!("{}", budget_bar("weekly", adj_week, (adj_week / 100.0 * budget.weekly_tokens as f64) as i64, budget.weekly_tokens));
                     println!("{}", budget_bar("5-hour", adj_5h, (adj_5h / 100.0 * budget.five_hr_tokens as f64) as i64, budget.five_hr_tokens));
-                    println!("  {} calibrated — tracked {week_pct:.0}%→{adj_week:.0}% wk, {five_hr_pct:.0}%→{adj_5h:.0}% 5h",
-                        "✓".green());
+                    let stale_label = if stale_mins < 5 { "just now".to_string() }
+                        else if stale_mins < 60 { format!("{}m ago", stale_mins) }
+                        else { format!("{}h{}m ago", stale_mins / 60, stale_mins % 60) };
+                    println!("  {} calibrated ({}) — tracked {week_pct:.0}%→{adj_week:.0}% wk, {five_hr_pct:.0}%→{adj_5h:.0}% 5h",
+                        "✓".green(), stale_label);
+                    if stale_mins > 30 {
+                        println!("  {} recalibrate: costguard-pulse calibrate --weekly-pct X --burst-pct Y", "⚠".yellow());
+                    }
                 } else {
                     println!("{}", budget_bar("weekly", week_pct, week_tokens, budget.weekly_tokens));
                     println!("{}", budget_bar("5-hour", five_hr_pct, five_hr_tokens, budget.five_hr_tokens));
@@ -849,15 +862,19 @@ fn main() -> Result<()> {
             if weekly_pct.is_none() && burst_pct.is_none() {
                 // Show current calibration
                 let cal_ts = db::get_config(&conn, "calibration_timestamp").unwrap_or_else(|| "never".to_string());
-                let cal_w = db::get_config(&conn, "calibration_weekly_offset")
+                let cal_wk_actual = db::get_config(&conn, "cal_actual_weekly_pct")
                     .and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
-                let cal_b = db::get_config(&conn, "calibration_5h_offset")
+                let cal_5h_actual = db::get_config(&conn, "cal_actual_5h_pct")
                     .and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+                let cal_wk_tracked = db::get_config(&conn, "cal_tracked_weekly_tokens")
+                    .and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+                let cal_5h_tracked = db::get_config(&conn, "cal_tracked_5h_tokens")
+                    .and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
                 println!("{}", "  costguard-pulse calibration".cyan().bold());
                 println!("  {}", "─".repeat(52).dimmed());
                 println!("  Last calibrated: {}", cal_ts);
-                println!("  Weekly offset:   {:+.1}%", cal_w);
-                println!("  5-hour offset:   {:+.1}%", cal_b);
+                println!("  Weekly: actual {cal_wk_actual:.1}% (tracked {} at cal)", format_tokens(cal_wk_tracked));
+                println!("  5-hour: actual {cal_5h_actual:.1}% (tracked {} at cal)", format_tokens(cal_5h_tracked));
                 println!();
                 println!("  To calibrate from claude.ai/settings/usage:");
                 println!("    costguard-pulse calibrate --weekly-pct 33 --burst-pct 65");
@@ -872,32 +889,20 @@ fn main() -> Result<()> {
                 let tracked_5h_pct = five_hr_tokens as f64 / budget.five_hr_tokens as f64 * 100.0;
 
                 if let Some(actual_wk) = weekly_pct {
-                    let offset = actual_wk - tracked_week_pct;
-                    db::set_config(&conn, "calibration_weekly_offset", &format!("{:.2}", offset))?;
-                    println!("  Weekly: tracked {tracked_week_pct:.1}% → actual {actual_wk:.1}% (offset {:+.1}%)", offset);
+                    db::set_config(&conn, "cal_actual_weekly_pct", &format!("{:.2}", actual_wk))?;
+                    db::set_config(&conn, "cal_tracked_weekly_tokens", &week_tokens.to_string())?;
+                    println!("  Weekly: tracked {tracked_week_pct:.1}% → actual {actual_wk:.1}% (gap {:+.1}%)", actual_wk - tracked_week_pct);
                 }
                 if let Some(actual_5h) = burst_pct {
-                    let offset = actual_5h - tracked_5h_pct;
-                    db::set_config(&conn, "calibration_5h_offset", &format!("{:.2}", offset))?;
-                    println!("  5-hour: tracked {tracked_5h_pct:.1}% → actual {actual_5h:.1}% (offset {:+.1}%)", offset);
-
-                    // Predict when the 5h window resets
-                    // If actual usage is X%, the window started (5h * X/100) ago
-                    // Reset happens at window_start + 5h = now + 5h * (1 - X/100)
-                    let remaining_frac = 1.0 - (actual_5h / 100.0);
-                    let remaining_minutes = (remaining_frac * 5.0 * 60.0) as i64;
-                    let reset_at = now + Duration::minutes(remaining_minutes);
-                    let reset_ts = reset_at.format("%Y-%m-%dT%H:%M:%S").to_string();
-                    db::set_config(&conn, "five_hr_reset_at", &reset_ts)?;
-                    println!("  5h window resets in ~{}h {}m (at {})",
-                        remaining_minutes / 60, remaining_minutes % 60,
-                        reset_at.format("%H:%M UTC"));
-                    println!("  → 5h offset will auto-zero at reset (fresh window)");
+                    db::set_config(&conn, "cal_actual_5h_pct", &format!("{:.2}", actual_5h))?;
+                    db::set_config(&conn, "cal_tracked_5h_tokens", &five_hr_tokens.to_string())?;
+                    println!("  5-hour: tracked {tracked_5h_pct:.1}% → actual {actual_5h:.1}% (gap {:+.1}%)", actual_5h - tracked_5h_pct);
+                    println!("  → snapshot-delta: your tracked usage adds on top of {actual_5h:.0}%");
+                    println!("  → valid for ~5h (rolling window), recalibrate when stale");
                 }
                 let ts = now.format("%Y-%m-%dT%H:%M:%S").to_string();
                 db::set_config(&conn, "calibration_timestamp", &ts)?;
                 println!("  Calibrated at {ts}");
-                println!("  Weekly offset decays linearly over 24h. Re-calibrate daily.");
             }
         }
         Commands::SyncRemote { host, user } => {
