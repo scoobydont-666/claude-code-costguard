@@ -3,7 +3,7 @@
 //! Track tokens, costs, and efficiency across Claude Code sessions.
 
 use anyhow::Result;
-use chrono::{Datelike, Duration, Utc};
+use chrono::{Duration, Utc};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use rusqlite::Connection;

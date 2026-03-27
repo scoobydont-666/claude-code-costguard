@@ -132,6 +132,9 @@ pub fn open() -> Result<Connection> {
     conn.execute_batch("ALTER TABLE sessions ADD COLUMN last_synced_at TEXT;").ok();
     conn.execute_batch("ALTER TABLE sessions ADD COLUMN prompt_count INTEGER DEFAULT 0;").ok();
     conn.execute_batch("ALTER TABLE tool_usage ADD COLUMN file_path TEXT;").ok();
+    conn.execute_batch("ALTER TABLE sessions ADD COLUMN subagent_input_tokens INTEGER DEFAULT 0;").ok();
+    conn.execute_batch("ALTER TABLE sessions ADD COLUMN subagent_output_tokens INTEGER DEFAULT 0;").ok();
+    conn.execute_batch("ALTER TABLE sessions ADD COLUMN subagent_cost_usd REAL DEFAULT 0.0;").ok();
     Ok(conn)
 }
 
@@ -393,24 +396,68 @@ pub fn compute_cost(
     cache_read: i64,
     cache_write: i64,
 ) -> f64 {
+    if let Some((inp, out, cw, cr)) = lookup_pricing(conn, model) {
+        return (input_tokens as f64 * inp
+            + output_tokens as f64 * out
+            + cache_write as f64 * cw
+            + cache_read as f64 * cr)
+            / 1_000_000.0;
+    }
+    0.0
+}
+
+/// Look up model pricing with fallback chain:
+/// 1. Exact match
+/// 2. Strip bracket annotation: "claude-opus-4-6[1m]" -> "claude-opus-4-6"
+/// 3. Strip date suffix: "claude-opus-4-6-20260401" -> "claude-opus-4-6"
+/// 4. Prefix match: find pricing row where model name is a prefix of the query
+fn lookup_pricing(conn: &Connection, model: &str) -> Option<(f64, f64, f64, f64)> {
+    // 1. Exact match
+    if let Some(p) = query_pricing(conn, model) {
+        return Some(p);
+    }
+
+    // 2. Strip bracket annotation: "claude-opus-4-6[1m]" -> "claude-opus-4-6"
+    if let Some(pos) = model.find('[') {
+        let stripped = &model[..pos];
+        if stripped != model {
+            if let Some(p) = query_pricing(conn, stripped) {
+                return Some(p);
+            }
+        }
+    }
+
+    // 3. Strip date suffix: "claude-opus-4-6-20260401" -> "claude-opus-4-6"
+    if let Some(pos) = model.rfind('-') {
+        let suffix = &model[pos + 1..];
+        if suffix.len() == 8 && suffix.bytes().all(|b| b.is_ascii_digit()) {
+            let stripped = &model[..pos];
+            if let Some(p) = query_pricing(conn, stripped) {
+                return Some(p);
+            }
+        }
+    }
+
+    // 4. Prefix match: find best pricing row where the pricing model is a prefix of the query
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT input_per_mtok, output_per_mtok, cache_write_per_mtok, cache_read_per_mtok FROM model_pricing WHERE ?1 LIKE model || '%' ORDER BY LENGTH(model) DESC LIMIT 1",
+        )
+        .unwrap();
+
+    stmt.query_row([model], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+    }).ok()
+}
+
+fn query_pricing(conn: &Connection, model: &str) -> Option<(f64, f64, f64, f64)> {
     let mut stmt = conn
         .prepare_cached(
             "SELECT input_per_mtok, output_per_mtok, cache_write_per_mtok, cache_read_per_mtok FROM model_pricing WHERE model = ?1",
         )
         .unwrap();
 
-    let result: Result<(f64, f64, f64, f64), _> = stmt.query_row([model], |row| {
+    stmt.query_row([model], |row| {
         Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-    });
-
-    match result {
-        Ok((inp, out, cw, cr)) => {
-            (input_tokens as f64 * inp
-                + output_tokens as f64 * out
-                + cache_write as f64 * cw
-                + cache_read as f64 * cr)
-                / 1_000_000.0
-        }
-        Err(_) => 0.0, // Unknown model
-    }
+    }).ok()
 }

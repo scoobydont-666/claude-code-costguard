@@ -29,15 +29,17 @@ pub fn parse(conn: &Connection, session_id: &str, path: &str) -> Result<Transcri
     let mut model_name = String::new();
     let mut message_count: i64 = 0;
     let mut tool_count: i64 = 0;
+    let mut total_cost: f64 = 0.0;
     let mut prompt_count: i64 = 0;
     let mut first_timestamp: Option<String> = None;
     let mut last_timestamp: Option<String> = None;
     let mut session_cwd: Option<String> = None;
     let mut session_branch: Option<String> = None;
 
-    // Clear existing tool_usage from transcript (we'll re-insert — idempotent)
+    // Clear existing tool_usage (both transcript-parsed and hook-inserted) — we'll re-insert from transcript.
+    // Hook-inserted rows have empty message_id; transcript rows have 'toolu_*' IDs.
     conn.execute(
-        "DELETE FROM tool_usage WHERE session_id = ?1 AND message_id LIKE 'toolu_%'",
+        "DELETE FROM tool_usage WHERE session_id = ?1 AND (message_id LIKE 'toolu_%' OR message_id = '' OR message_id IS NULL)",
         [session_id],
     )?;
 
@@ -88,6 +90,7 @@ pub fn parse(conn: &Connection, session_id: &str, path: &str) -> Result<Transcri
                     message_count += 1;
 
                     let cost = db::compute_cost(conn, &model_name, input, output, cache_read, cache_write);
+                    total_cost += cost;
 
                     let uuid = entry.get("uuid").and_then(|v| v.as_str()).unwrap_or("");
                     let timestamp = entry.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
@@ -144,12 +147,31 @@ pub fn parse(conn: &Connection, session_id: &str, path: &str) -> Result<Transcri
         }
     }
 
+    // Parse subagent transcripts and add to session totals
+    let mut subagent_input: i64 = 0;
+    let mut subagent_output: i64 = 0;
+    let mut subagent_cost: f64 = 0.0;
+    for (agent_id, agent_path) in discover_subagent_files(path) {
+        match parse_subagent(conn, session_id, &agent_id, &agent_path) {
+            Ok((ai, ao, ac)) => {
+                subagent_input += ai;
+                subagent_output += ao;
+                subagent_cost += ac;
+            }
+            Err(e) => {
+                db::log_sync_error(conn, session_id, &format!("subagent {agent_id}: {e}"));
+            }
+        }
+    }
+    total_input += subagent_input;
+    total_output += subagent_output;
+    total_cost += subagent_cost;
+
     // Update session totals (overwrite, not accumulate — idempotent)
-    let total_cost = db::compute_cost(conn, &model_name, total_input, total_output, total_cache_read, total_cache_write);
     let now = chrono::Utc::now().to_rfc3339();
     conn.execute(
-        "UPDATE sessions SET model = COALESCE(NULLIF(?1, ''), model), total_input_tokens = ?2, total_output_tokens = ?3, total_cache_read = ?4, total_cache_write = ?5, total_cost_usd = ?6, started_at = COALESCE(?7, started_at), ended_at = COALESCE(?8, ended_at), project = COALESCE(NULLIF(?9, ''), project), git_branch = COALESCE(NULLIF(?10, ''), git_branch), last_synced_at = ?11, prompt_count = ?12 WHERE id = ?13",
-        rusqlite::params![model_name, total_input, total_output, total_cache_read, total_cache_write, total_cost, first_timestamp, last_timestamp, session_cwd, session_branch, now, prompt_count, session_id],
+        "UPDATE sessions SET model = COALESCE(NULLIF(?1, ''), model), total_input_tokens = ?2, total_output_tokens = ?3, total_cache_read = ?4, total_cache_write = ?5, total_cost_usd = ?6, started_at = COALESCE(?7, started_at), ended_at = COALESCE(?8, ended_at), project = COALESCE(NULLIF(?9, ''), project), git_branch = COALESCE(NULLIF(?10, ''), git_branch), last_synced_at = ?11, prompt_count = ?12, subagent_input_tokens = ?14, subagent_output_tokens = ?15, subagent_cost_usd = ?16 WHERE id = ?13",
+        rusqlite::params![model_name, total_input, total_output, total_cache_read, total_cache_write, total_cost, first_timestamp, last_timestamp, session_cwd, session_branch, now, prompt_count, session_id, subagent_input, subagent_output, subagent_cost],
     )?;
 
     Ok(TranscriptResult { message_count, tool_count, total_cost, prompt_count })
@@ -157,7 +179,25 @@ pub fn parse(conn: &Connection, session_id: &str, path: &str) -> Result<Transcri
 
 /// Fast token summation from a transcript file — no DB writes.
 /// Used by statusline for live session data. Returns (input, output, cache_read, cache_write).
+/// Includes subagent transcripts if they exist.
 pub fn quick_sum_tokens(path: &str) -> Result<(i64, i64, i64, i64)> {
+    let (mut input, mut output, mut cache_read, mut cache_write) = quick_sum_file(path)?;
+
+    // Also sum subagent transcripts
+    for (_agent_id, agent_path) in discover_subagent_files(path) {
+        if let Ok((ai, ao, acr, acw)) = quick_sum_file(&agent_path) {
+            input += ai;
+            output += ao;
+            cache_read += acr;
+            cache_write += acw;
+        }
+    }
+
+    Ok((input, output, cache_read, cache_write))
+}
+
+/// Sum tokens from a single JSONL file (no subagent recursion).
+fn quick_sum_file(path: &str) -> Result<(i64, i64, i64, i64)> {
     let content = std::fs::read_to_string(path)?;
     let mut input = 0i64;
     let mut output = 0i64;
@@ -287,4 +327,87 @@ fn sync_all_inner(conn: &Connection, force: bool, results: &mut Vec<(String, Tra
     }
 
     Ok(())
+}
+
+/// Discover subagent transcript files for a session.
+/// Given `/path/<session-id>.jsonl`, looks for `/path/<session-id>/subagents/agent-*.jsonl`.
+/// Returns Vec of (agent_id, jsonl_path).
+fn discover_subagent_files(transcript_path: &str) -> Vec<(String, String)> {
+    let path = std::path::Path::new(transcript_path);
+    let stem = match path.file_stem().and_then(|s| s.to_str()) {
+        Some(s) => s,
+        None => return vec![],
+    };
+    let parent = match path.parent() {
+        Some(p) => p,
+        None => return vec![],
+    };
+    let subagent_dir = parent.join(stem).join("subagents");
+    if !subagent_dir.is_dir() {
+        return vec![];
+    }
+
+    let mut results = vec![];
+    if let Ok(entries) = std::fs::read_dir(&subagent_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            if let Some(fname) = p.file_stem().and_then(|s| s.to_str()) {
+                if let Some(agent_id) = fname.strip_prefix("agent-") {
+                    if let Some(path_str) = p.to_str() {
+                        results.push((agent_id.to_string(), path_str.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    results
+}
+
+/// Parse a subagent transcript and insert into the session.
+/// Returns (input_tokens, output_tokens, cost).
+fn parse_subagent(conn: &Connection, _session_id: &str, _agent_id: &str, agent_path: &str) -> Result<(i64, i64, f64)> {
+    let content = std::fs::read_to_string(agent_path)?;
+    let mut total_input: i64 = 0;
+    let mut total_output: i64 = 0;
+    let mut total_cost: f64 = 0.0;
+    let mut model_name = String::new();
+
+    for line in content.lines() {
+        let entry: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let entry_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        if entry_type == "assistant" {
+            if let Some(msg) = entry.get("message") {
+                // Extract model
+                if let Some(m) = msg.get("model").and_then(|v| v.as_str()) {
+                    if !m.is_empty() && !m.starts_with('<') {
+                        model_name = m.to_string();
+                    }
+                }
+
+                // Extract usage
+                if let Some(usage) = msg.get("usage") {
+                    let input = usage.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let output = usage.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let cache_read = usage.get("cache_read_input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let cache_write = usage.get("cache_creation_input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+
+                    total_input += input;
+                    total_output += output;
+
+                    let cost = db::compute_cost(conn, &model_name, input, output, cache_read, cache_write);
+                    total_cost += cost;
+                }
+            }
+        }
+    }
+
+    Ok((total_input, total_output, total_cost))
 }

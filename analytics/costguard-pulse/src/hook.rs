@@ -209,13 +209,22 @@ fn main() -> Result<()> {
                         // Fork-and-detach: spawn a detached process for transcript parsing.
                         // Returns immediately so the hook doesn't timeout on large transcripts.
                         let self_exe = env::current_exe().unwrap_or_else(|_| "costguard-pulse-hook".into());
-                        std::process::Command::new(self_exe)
+                        match std::process::Command::new(&self_exe)
                             .args(["sync-session", session_id, &path])
                             .stdin(std::process::Stdio::null())
                             .stdout(std::process::Stdio::null())
                             .stderr(std::process::Stdio::null())
                             .spawn()
-                            .ok();
+                        {
+                            Ok(_) => {}
+                            Err(e) => {
+                                db::log_sync_error(&conn, session_id, &format!("spawn sync-session failed: {e}"));
+                                // Fallback: inline parse (slower but prevents data loss)
+                                if let Err(e2) = transcript::parse(&conn, session_id, &path) {
+                                    db::log_sync_error(&conn, session_id, &e2.to_string());
+                                }
+                            }
+                        }
                     }
                 }
             }
