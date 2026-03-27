@@ -444,33 +444,46 @@ fn cmd_statusline(conn: &Connection) -> Result<()> {
     let week_start = (now - Duration::days(7)).format("%Y-%m-%dT%H:%M:%S").to_string();
     let five_hr_start = (now - Duration::hours(5)).format("%Y-%m-%dT%H:%M:%S").to_string();
 
-    let week_tokens = db::tokens_in_window(conn, &week_start);
-    let five_hr_tokens = db::tokens_in_window(conn, &five_hr_start);
+    let mut week_tokens = db::tokens_in_window(conn, &week_start);
+    let mut five_hr_tokens = db::tokens_in_window(conn, &five_hr_start);
     let cache_hit = db::cache_hit_in_window(conn, &week_start);
+
+    // Get current session token usage (most recent session)
+    let (db_session_tokens, transcript_path, session_started): (i64, Option<String>, Option<String>) = conn.query_row(
+        "SELECT COALESCE(total_input_tokens + total_output_tokens + total_cache_read + total_cache_write, 0), transcript_path, started_at FROM sessions ORDER BY started_at DESC LIMIT 1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    ).unwrap_or((0, None, None));
+
+    // Always try live transcript for the most recent session — DB may have stale/partial data.
+    // Use the larger of DB vs live value (live is always more current for active sessions).
+    let live_tokens = transcript_path
+        .as_deref()
+        .filter(|tp| !tp.is_empty() && std::path::Path::new(tp).exists())
+        .and_then(|tp| transcript::quick_sum_tokens(tp).ok())
+        .map(|(i, o, cr, cw)| i + o + cr + cw)
+        .unwrap_or(0);
+
+    let session_tokens = db_session_tokens.max(live_tokens);
+
+    // If live tokens > DB tokens, the window aggregates are understated by the delta.
+    // Add the live delta to any window the current session falls within.
+    let live_delta = (live_tokens - db_session_tokens).max(0);
+    if live_delta > 0 {
+        if let Some(ref started) = session_started {
+            if started.as_str() >= week_start.as_str() {
+                week_tokens += live_delta;
+            }
+            if started.as_str() >= five_hr_start.as_str() {
+                five_hr_tokens += live_delta;
+            }
+        }
+    }
 
     let week_pct = week_tokens as f64 / budget.weekly_tokens as f64 * 100.0;
     let five_hr_pct = five_hr_tokens as f64 / budget.five_hr_tokens as f64 * 100.0;
 
     let (adj_week, adj_5h, is_cal) = calibrated_pcts(conn, week_pct, five_hr_pct);
-
-    // Get current session token usage (most recent session)
-    let (db_session_tokens, transcript_path): (i64, Option<String>) = conn.query_row(
-        "SELECT COALESCE(total_input_tokens + total_output_tokens + total_cache_read + total_cache_write, 0), transcript_path FROM sessions ORDER BY started_at DESC LIMIT 1",
-        [],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    ).unwrap_or((0, None));
-
-    // If session has no parsed tokens yet but has a transcript, read it directly
-    let session_tokens = if db_session_tokens == 0 {
-        transcript_path
-            .as_deref()
-            .filter(|tp| !tp.is_empty() && std::path::Path::new(tp).exists())
-            .and_then(|tp| transcript::quick_sum_tokens(tp).ok())
-            .map(|(i, o, cr, cw)| i + o + cr + cw)
-            .unwrap_or(0)
-    } else {
-        db_session_tokens
-    };
 
     let (wk, fh) = if is_cal { (adj_week, adj_5h) } else { (week_pct, five_hr_pct) };
 
