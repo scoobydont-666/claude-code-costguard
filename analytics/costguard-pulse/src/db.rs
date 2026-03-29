@@ -185,6 +185,32 @@ pub fn tokens_in_window(conn: &Connection, window_start: &str) -> i64 {
     ).unwrap_or(0)
 }
 
+/// Query tokens per model in a rolling window.
+pub struct ModelTokens {
+    pub model: String,
+    pub tokens: i64,
+}
+
+pub fn tokens_in_window_by_model(conn: &Connection, window_start: &str) -> Vec<ModelTokens> {
+    let mut stmt = conn.prepare(
+        "SELECT COALESCE(model, 'unknown'), \
+         COALESCE(SUM(total_input_tokens + total_cache_read + total_cache_write + total_output_tokens), 0) \
+         FROM sessions WHERE started_at >= ?1 GROUP BY model ORDER BY 2 DESC"
+    ).unwrap();
+    stmt.query_map([window_start], |row| {
+        Ok(ModelTokens { model: row.get(0)?, tokens: row.get(1)? })
+    }).unwrap().filter_map(|r| r.ok()).collect()
+}
+
+/// Query the oldest session start time in a rolling window.
+pub fn oldest_session_in_window(conn: &Connection, window_start: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT started_at FROM sessions WHERE started_at >= ?1 ORDER BY started_at ASC LIMIT 1",
+        [window_start],
+        |row| row.get(0),
+    ).ok()
+}
+
 /// Query cache hit rate in a rolling window.
 pub fn cache_hit_in_window(conn: &Connection, window_start: &str) -> f64 {
     conn.query_row(
