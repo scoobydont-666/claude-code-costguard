@@ -3,7 +3,7 @@
 //! Track tokens, costs, and efficiency across Claude Code sessions.
 
 use anyhow::Result;
-use chrono::{Duration, Utc};
+use chrono::{Datelike, Duration, Timelike, Utc};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use rusqlite::Connection;
@@ -182,6 +182,108 @@ fn format_tokens(n: i64) -> String {
     }
 }
 
+/// Shared window token calculation with live transcript delta applied.
+/// Returns (week_tokens, five_hr_tokens, session_tokens, cache_hit).
+fn window_tokens_with_live(conn: &Connection) -> (i64, i64, i64, f64) {
+    let now = Utc::now();
+    let week_start = (now - Duration::days(7)).format("%Y-%m-%dT%H:%M:%S").to_string();
+    let five_hr_start = (now - Duration::hours(5)).format("%Y-%m-%dT%H:%M:%S").to_string();
+
+    let mut week_tokens = db::tokens_in_window(conn, &week_start);
+    let mut five_hr_tokens = db::tokens_in_window(conn, &five_hr_start);
+    let cache_hit = db::cache_hit_in_window(conn, &week_start);
+
+    let (db_session_tokens, transcript_path, session_started): (i64, Option<String>, Option<String>) = conn.query_row(
+        "SELECT COALESCE(total_input_tokens + total_output_tokens + total_cache_read + total_cache_write, 0), transcript_path, started_at FROM sessions ORDER BY started_at DESC LIMIT 1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    ).unwrap_or((0, None, None));
+
+    let live_tokens = transcript_path
+        .as_deref()
+        .filter(|tp| !tp.is_empty() && std::path::Path::new(tp).exists())
+        .and_then(|tp| transcript::quick_sum_tokens(tp).ok())
+        .map(|(i, o, cr, cw)| i + o + cr + cw)
+        .unwrap_or(0);
+
+    let session_tokens = db_session_tokens.max(live_tokens);
+    let live_delta = (live_tokens - db_session_tokens).max(0);
+
+    if live_delta > 0 {
+        if let Some(ref started) = session_started {
+            if started.as_str() >= week_start.as_str() {
+                week_tokens += live_delta;
+            }
+            if started.as_str() >= five_hr_start.as_str() {
+                five_hr_tokens += live_delta;
+            }
+        }
+    }
+
+    (week_tokens, five_hr_tokens, session_tokens, cache_hit)
+}
+
+/// Compute time until next weekly reset.
+/// Returns human-readable string like "Fri 9a" and duration string like "2d 5h".
+fn weekly_reset_info(conn: &Connection) -> (String, String) {
+    let reset_day: u32 = db::get_config(conn, "weekly_reset_day")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4); // 0=Mon, 4=Fri
+    let reset_hour_utc: u32 = db::get_config(conn, "weekly_reset_hour_utc")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16); // 16 UTC = 9am PT
+
+    let now = Utc::now();
+    let current_weekday = now.weekday().num_days_from_monday(); // 0=Mon
+    let mut days_until = (reset_day as i64 - current_weekday as i64 + 7) % 7;
+    // If it's reset day but past the hour, next week
+    if days_until == 0 && now.hour() >= reset_hour_utc {
+        days_until = 7;
+    }
+
+    let day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    let day_label = day_names[reset_day as usize % 7];
+
+    let reset_time = (now + Duration::days(days_until))
+        .date_naive()
+        .and_hms_opt(reset_hour_utc, 0, 0)
+        .unwrap();
+    let reset_dt = chrono::DateTime::<Utc>::from_naive_utc_and_offset(reset_time, Utc);
+    let diff = reset_dt - now;
+
+    let hours = diff.num_hours();
+    let days = hours / 24;
+    let remaining_hours = hours % 24;
+    let until = if days > 0 {
+        format!("{}d {}h", days, remaining_hours)
+    } else {
+        format!("{}h", remaining_hours)
+    };
+
+    (format!("{day_label}"), until)
+}
+
+/// Compute time until oldest session in 5h window ages out.
+fn burst_drop_info(conn: &Connection) -> Option<String> {
+    let now = Utc::now();
+    let five_hr_start = (now - Duration::hours(5)).format("%Y-%m-%dT%H:%M:%S").to_string();
+    let oldest = db::oldest_session_in_window(conn, &five_hr_start)?;
+    let oldest_dt = chrono::NaiveDateTime::parse_from_str(&oldest[..oldest.len().min(19)], "%Y-%m-%dT%H:%M:%S").ok()?;
+    let drop_at = oldest_dt + Duration::hours(5);
+    let drop_dt = chrono::DateTime::<Utc>::from_naive_utc_and_offset(drop_at, Utc);
+    let diff = drop_dt - now;
+    if diff.num_minutes() <= 0 {
+        return Some("now".to_string());
+    }
+    let hours = diff.num_hours();
+    let mins = diff.num_minutes() % 60;
+    if hours > 0 {
+        Some(format!("{}h{}m", hours, mins))
+    } else {
+        Some(format!("{}m", mins))
+    }
+}
+
 fn budget_bar(label: &str, pct: f64, used: i64, cap: i64) -> String {
     let bar_width = 25;
     let filled = ((pct / 100.0) * bar_width as f64).min(bar_width as f64).max(0.0) as usize;
@@ -216,29 +318,50 @@ fn cmd_stats(conn: &Connection, period: &str) -> Result<()> {
     let total_all = total_in + output;
     let hit_rate = if total_in > 0 { cache_read as f64 / total_in as f64 * 100.0 } else { 0.0 };
 
-    // Rolling window calculations
-    let week_start = (now - Duration::days(7)).format("%Y-%m-%dT%H:%M:%S").to_string();
-    let five_hr_start = (now - Duration::hours(5)).format("%Y-%m-%dT%H:%M:%S").to_string();
-
-    let week_tokens = db::tokens_in_window(conn, &week_start);
-    let five_hr_tokens = db::tokens_in_window(conn, &five_hr_start);
+    // Rolling window calculations (with live delta)
+    let (week_tokens, five_hr_tokens, _, _) = window_tokens_with_live(conn);
 
     let week_pct = week_tokens as f64 / budget.weekly_tokens as f64 * 100.0;
     let five_hr_pct = five_hr_tokens as f64 / budget.five_hr_tokens as f64 * 100.0;
+    let (adj_week, adj_5h, _stale_mins, is_cal) = calibrated_pcts(conn, week_pct, five_hr_pct,
+        week_tokens, five_hr_tokens, &budget);
 
     // Daily burn rate (over last 7 days)
     let daily_rate = week_tokens / 7;
 
+    // Reset time info
+    let (reset_day, reset_until) = weekly_reset_info(conn);
+    let drop_info = burst_drop_info(conn);
+
     println!("{}", format!("  costguard-pulse stats — {period}").cyan().bold());
     println!("  {}", "─".repeat(52).dimmed());
 
-    // Budget bars
+    // Budget bars (use calibrated % when available, always show real tracked tokens)
+    let (disp_week, disp_5h) = if is_cal { (adj_week, adj_5h) } else { (week_pct, five_hr_pct) };
     println!("{}", format!("  {} plan", budget.plan_name).bold());
-    println!("{}", budget_bar("weekly", week_pct, week_tokens, budget.weekly_tokens));
-    println!("{}", budget_bar("5-hour", five_hr_pct, five_hr_tokens, budget.five_hr_tokens));
+    let weekly_reset_label = format!("  resets {reset_day} (in {reset_until})").dimmed().to_string();
+    println!("{}  {}", budget_bar("weekly", disp_week, week_tokens, budget.weekly_tokens), weekly_reset_label);
+    let burst_label = drop_info.map(|d| format!("  next drop in {d}").dimmed().to_string()).unwrap_or_default();
+    println!("{}  {}", budget_bar("5-hour", disp_5h, five_hr_tokens, budget.five_hr_tokens), burst_label);
+    if is_cal {
+        println!("    {} calibrated — tracked {week_pct:.0}%→{adj_week:.0}% wk, {five_hr_pct:.0}%→{adj_5h:.0}% 5h",
+            "✓".green());
+    }
     println!("    {} avg/day  |  {:.1} days at current rate",
         format_tokens(daily_rate),
         if daily_rate > 0 { (budget.weekly_tokens - week_tokens) as f64 / daily_rate as f64 } else { 99.0 });
+
+    // Per-model breakdown (weekly window)
+    let week_start = (now - Duration::days(7)).format("%Y-%m-%dT%H:%M:%S").to_string();
+    let model_breakdown = db::tokens_in_window_by_model(conn, &week_start);
+    if !model_breakdown.is_empty() {
+        println!("    {}", "by model (7d):".dimmed());
+        for mt in &model_breakdown {
+            let short_model = mt.model.split('[').next().unwrap_or(&mt.model);
+            let model_pct = if week_tokens > 0 { mt.tokens as f64 / week_tokens as f64 * 100.0 } else { 0.0 };
+            println!("      {:30} {:>8}  ({:.0}%)", short_model.dimmed(), format_tokens(mt.tokens), model_pct);
+        }
+    }
     println!();
 
     // Period stats
@@ -433,55 +556,16 @@ fn calibrated_pcts(conn: &Connection, tracked_week_pct: f64, tracked_5h_pct: f64
 
 fn cmd_statusline(conn: &Connection) -> Result<()> {
     let budget = db::get_plan_budget(conn);
-    let now = Utc::now();
-
-    let week_start = (now - Duration::days(7)).format("%Y-%m-%dT%H:%M:%S").to_string();
-    let five_hr_start = (now - Duration::hours(5)).format("%Y-%m-%dT%H:%M:%S").to_string();
-
-    let mut week_tokens = db::tokens_in_window(conn, &week_start);
-    let mut five_hr_tokens = db::tokens_in_window(conn, &five_hr_start);
-    let cache_hit = db::cache_hit_in_window(conn, &week_start);
-
-    // Get current session token usage (most recent session)
-    let (db_session_tokens, transcript_path, session_started): (i64, Option<String>, Option<String>) = conn.query_row(
-        "SELECT COALESCE(total_input_tokens + total_output_tokens + total_cache_read + total_cache_write, 0), transcript_path, started_at FROM sessions ORDER BY started_at DESC LIMIT 1",
-        [],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-    ).unwrap_or((0, None, None));
-
-    // Always try live transcript for the most recent session — DB may have stale/partial data.
-    // Use the larger of DB vs live value (live is always more current for active sessions).
-    let live_tokens = transcript_path
-        .as_deref()
-        .filter(|tp| !tp.is_empty() && std::path::Path::new(tp).exists())
-        .and_then(|tp| transcript::quick_sum_tokens(tp).ok())
-        .map(|(i, o, cr, cw)| i + o + cr + cw)
-        .unwrap_or(0);
-
-    let session_tokens = db_session_tokens.max(live_tokens);
-
-    // If live tokens > DB tokens, the window aggregates are understated by the delta.
-    // Add the live delta to any window the current session falls within.
-    let live_delta = (live_tokens - db_session_tokens).max(0);
-    if live_delta > 0 {
-        if let Some(ref started) = session_started {
-            if started.as_str() >= week_start.as_str() {
-                week_tokens += live_delta;
-            }
-            if started.as_str() >= five_hr_start.as_str() {
-                five_hr_tokens += live_delta;
-            }
-        }
-    }
+    let (week_tokens, five_hr_tokens, session_tokens, cache_hit) = window_tokens_with_live(conn);
 
     let week_pct = week_tokens as f64 / budget.weekly_tokens as f64 * 100.0;
     let five_hr_pct = five_hr_tokens as f64 / budget.five_hr_tokens as f64 * 100.0;
 
-    let (wk, fh, stale_mins, _is_cal) = calibrated_pcts(conn, week_pct, five_hr_pct,
+    let (wk, fh, stale_mins, is_cal) = calibrated_pcts(conn, week_pct, five_hr_pct,
         week_tokens, five_hr_tokens, &budget);
 
     // Staleness indicator for 5h window (only when calibrated)
-    let stale_tag = if stale_mins >= 9999 {
+    let stale_tag = if !is_cal {
         String::new()
     } else if stale_mins < 5 {
         " ~".to_string()
@@ -490,11 +574,17 @@ fn cmd_statusline(conn: &Connection) -> Result<()> {
     } else if stale_mins < 300 {
         format!(" ~{}h{}m", stale_mins / 60, stale_mins % 60)
     } else {
-        " ??".to_string()
+        " (stale)".to_string()
     };
 
+    // Reset info
+    let (reset_day, _) = weekly_reset_info(conn);
+    let drop_tag = burst_drop_info(conn)
+        .map(|d| format!(" -{d}"))
+        .unwrap_or_default();
+
     print!(
-        "wk {wk:.0}% ({}) | 5h {fh:.0}%{stale_tag} | sess {} | {:.0}% cache",
+        "wk {wk:.0}% ({}) {reset_day} | 5h {fh:.0}%{stale_tag}{drop_tag} | sess {} | {:.0}% cache",
         format_tokens(week_tokens),
         format_tokens(session_tokens),
         cache_hit,
@@ -801,11 +891,7 @@ fn main() -> Result<()> {
         Commands::Budget { weekly, five_hr, plan } => {
             if weekly.is_none() && five_hr.is_none() && plan.is_none() {
                 let budget = db::get_plan_budget(&conn);
-                let now = Utc::now();
-                let week_start = (now - Duration::days(7)).format("%Y-%m-%dT%H:%M:%S").to_string();
-                let five_hr_start = (now - Duration::hours(5)).format("%Y-%m-%dT%H:%M:%S").to_string();
-                let week_tokens = db::tokens_in_window(&conn, &week_start);
-                let five_hr_tokens = db::tokens_in_window(&conn, &five_hr_start);
+                let (week_tokens, five_hr_tokens, _, _) = window_tokens_with_live(&conn);
 
                 let week_pct = week_tokens as f64 / budget.weekly_tokens as f64 * 100.0;
                 let five_hr_pct = five_hr_tokens as f64 / budget.five_hr_tokens as f64 * 100.0;
@@ -880,11 +966,7 @@ fn main() -> Result<()> {
                 println!("    costguard-pulse calibrate --weekly-pct 33 --burst-pct 65");
             } else {
                 let budget = db::get_plan_budget(&conn);
-                let now = Utc::now();
-                let week_start = (now - Duration::days(7)).format("%Y-%m-%dT%H:%M:%S").to_string();
-                let five_hr_start = (now - Duration::hours(5)).format("%Y-%m-%dT%H:%M:%S").to_string();
-                let week_tokens = db::tokens_in_window(&conn, &week_start);
-                let five_hr_tokens = db::tokens_in_window(&conn, &five_hr_start);
+                let (week_tokens, five_hr_tokens, _, _) = window_tokens_with_live(&conn);
                 let tracked_week_pct = week_tokens as f64 / budget.weekly_tokens as f64 * 100.0;
                 let tracked_5h_pct = five_hr_tokens as f64 / budget.five_hr_tokens as f64 * 100.0;
 
@@ -900,7 +982,7 @@ fn main() -> Result<()> {
                     println!("  → snapshot-delta: your tracked usage adds on top of {actual_5h:.0}%");
                     println!("  → valid for ~5h (rolling window), recalibrate when stale");
                 }
-                let ts = now.format("%Y-%m-%dT%H:%M:%S").to_string();
+                let ts = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
                 db::set_config(&conn, "calibration_timestamp", &ts)?;
                 println!("  Calibrated at {ts}");
             }

@@ -366,14 +366,17 @@ fn discover_subagent_files(transcript_path: &str) -> Vec<(String, String)> {
     results
 }
 
-/// Parse a subagent transcript and insert into the session.
-/// Returns (input_tokens, output_tokens, cost).
-fn parse_subagent(conn: &Connection, _session_id: &str, _agent_id: &str, agent_path: &str) -> Result<(i64, i64, f64)> {
-    let content = std::fs::read_to_string(agent_path)?;
+/// Parse a subagent transcript JSONL and update the subagents table.
+/// Returns (input_tokens, output_tokens, cost_usd).
+fn parse_subagent(conn: &Connection, session_id: &str, agent_id: &str, path: &str) -> Result<(i64, i64, f64)> {
+    let content = std::fs::read_to_string(path)?;
+
     let mut total_input: i64 = 0;
     let mut total_output: i64 = 0;
     let mut total_cost: f64 = 0.0;
     let mut model_name = String::new();
+    let mut first_timestamp: Option<String> = None;
+    let mut last_timestamp: Option<String> = None;
 
     for line in content.lines() {
         let entry: serde_json::Value = match serde_json::from_str(line) {
@@ -381,33 +384,52 @@ fn parse_subagent(conn: &Connection, _session_id: &str, _agent_id: &str, agent_p
             Err(_) => continue,
         };
 
+        if first_timestamp.is_none() {
+            first_timestamp = entry.get("timestamp").and_then(|v| v.as_str()).map(String::from);
+        }
+        if let Some(ts) = entry.get("timestamp").and_then(|v| v.as_str()) {
+            last_timestamp = Some(ts.to_string());
+        }
+
         let entry_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if entry_type != "assistant" {
+            continue;
+        }
 
-        if entry_type == "assistant" {
-            if let Some(msg) = entry.get("message") {
-                // Extract model
-                if let Some(m) = msg.get("model").and_then(|v| v.as_str()) {
-                    if !m.is_empty() && !m.starts_with('<') {
-                        model_name = m.to_string();
-                    }
+        if let Some(msg) = entry.get("message") {
+            if let Some(m) = msg.get("model").and_then(|v| v.as_str()) {
+                if !m.is_empty() && !m.starts_with('<') {
+                    model_name = m.to_string();
                 }
+            }
 
-                // Extract usage
-                if let Some(usage) = msg.get("usage") {
-                    let input = usage.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-                    let output = usage.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-                    let cache_read = usage.get("cache_read_input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-                    let cache_write = usage.get("cache_creation_input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+            if let Some(usage) = msg.get("usage") {
+                let input = usage.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                let output = usage.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                let cache_read = usage.get("cache_read_input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                let cache_write = usage.get("cache_creation_input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
 
-                    total_input += input;
-                    total_output += output;
-
-                    let cost = db::compute_cost(conn, &model_name, input, output, cache_read, cache_write);
-                    total_cost += cost;
-                }
+                total_input += input;
+                total_output += output;
+                let cost = db::compute_cost(conn, &model_name, input, output, cache_read, cache_write);
+                total_cost += cost;
             }
         }
     }
+
+    // Ensure subagent row exists (INSERT if hook missed agent-start)
+    let now = chrono::Utc::now().to_rfc3339();
+    let started = first_timestamp.as_deref().unwrap_or(&now);
+    conn.execute(
+        "INSERT OR IGNORE INTO subagents (id, session_id, model, started_at) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![agent_id, session_id, model_name, started],
+    )?;
+
+    // Update with parsed token data
+    conn.execute(
+        "UPDATE subagents SET input_tokens = ?1, output_tokens = ?2, cost_usd = ?3, model = COALESCE(NULLIF(?4, ''), model), ended_at = COALESCE(?5, ended_at) WHERE id = ?6",
+        rusqlite::params![total_input, total_output, total_cost, model_name, last_timestamp, agent_id],
+    )?;
 
     Ok((total_input, total_output, total_cost))
 }
