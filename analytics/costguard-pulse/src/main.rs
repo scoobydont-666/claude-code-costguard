@@ -127,6 +127,27 @@ enum Commands {
         #[arg(short, long, default_value = "week")]
         period: String,
     },
+    /// Show fleet-wide cost aggregation across all hosts
+    FleetCosts {
+        #[arg(short, long, default_value = "week")]
+        period: String,
+    },
+    /// Show per-project efficiency scores (tokens/commit, waste ratio, cache hit rate)
+    EfficiencyScores {
+        #[arg(short, long, default_value = "week")]
+        period: String,
+    },
+    /// Check per-project daily budget alerts
+    BudgetAlerts,
+    /// Set daily budget limit for a project (default: $50)
+    SetBudget {
+        /// Project name (or "default" for global default)
+        #[arg(short, long)]
+        project: String,
+        /// Daily spending limit in USD
+        #[arg(short, long)]
+        limit: f64,
+    },
 }
 
 /// Parse human-friendly token amounts: "500M", "1B", "2.5B", "1000000000"
@@ -1048,6 +1069,10 @@ fn main() -> Result<()> {
         Commands::ProjectCosts { period } => cmd_project_costs(&conn, &period)?,
         Commands::TaskCosts { period } => cmd_task_costs(&conn, &period)?,
         Commands::Anomalies { period } => cmd_anomalies(&conn, &period)?,
+        Commands::FleetCosts { period } => cmd_fleet_costs(&conn, &period)?,
+        Commands::EfficiencyScores { period } => cmd_efficiency_scores(&conn, &period)?,
+        Commands::BudgetAlerts => cmd_budget_alerts(&conn)?,
+        Commands::SetBudget { project, limit } => cmd_set_budget(&conn, &project, limit)?,
     }
 
     Ok(())
@@ -1174,5 +1199,91 @@ fn cmd_anomalies(conn: &Connection, period: &str) -> Result<()> {
     }
 
     println!("{table}");
+    Ok(())
+}
+
+// -----------------------------------------------------------------------
+// Phase 4: Fleet costs, efficiency scoring, budget alerts
+// -----------------------------------------------------------------------
+
+fn cmd_fleet_costs(conn: &Connection, period: &str) -> Result<()> {
+    let since = period_to_timestamp(period);
+    let fleet = db::fleet_costs(conn, &since);
+    if fleet.is_empty() {
+        println!("{}", "No session data for this period.".dimmed());
+        return Ok(());
+    }
+    println!("{}", "Fleet Cost Aggregation".bold().cyan());
+    println!("{}", format!("Period: {period}").dimmed());
+    println!();
+    let mut table = comfy_table::Table::new();
+    table.set_header(vec!["Host", "Sessions", "Cost ($)", "Input Tokens", "Output Tokens", "Cache Hit %", "Projects"]);
+    table.load_preset(comfy_table::presets::UTF8_FULL_CONDENSED);
+    let mut total_cost = 0.0;
+    for h in &fleet {
+        total_cost += h.total_cost;
+        table.add_row(vec![
+            h.hostname.clone(), h.sessions.to_string(), format!("{:.2}", h.total_cost),
+            format_tokens(h.total_input_tokens), format_tokens(h.total_output_tokens),
+            format!("{:.1}%", h.cache_hit_pct), h.projects.to_string(),
+        ]);
+    }
+    println!("{table}");
+    println!("Fleet total: {}", format!("${:.2}", total_cost).bold().green());
+    Ok(())
+}
+
+fn cmd_efficiency_scores(conn: &Connection, period: &str) -> Result<()> {
+    let since = period_to_timestamp(period);
+    let scores = db::efficiency_scores(conn, &since);
+    if scores.is_empty() {
+        println!("{}", "No session data for this period.".dimmed());
+        return Ok(());
+    }
+    println!("{}", "Efficiency Scores".bold().cyan());
+    println!();
+    let mut table = comfy_table::Table::new();
+    table.set_header(vec!["Project", "Tokens/Commit", "$/Commit", "Waste %", "Cache Hit %", "Avg $/Session"]);
+    table.load_preset(comfy_table::presets::UTF8_FULL_CONDENSED);
+    for s in &scores {
+        let p = s.project.split('/').last().unwrap_or(&s.project);
+        table.add_row(vec![
+            p.to_string(),
+            if s.tokens_per_commit > 0.0 { format_tokens(s.tokens_per_commit as i64) } else { "-".into() },
+            if s.cost_per_commit > 0.0 { format!("{:.3}", s.cost_per_commit) } else { "-".into() },
+            format!("{:.1}%", s.waste_ratio * 100.0),
+            format!("{:.1}%", s.cache_hit_rate),
+            format!("{:.3}", s.avg_session_cost),
+        ]);
+    }
+    println!("{table}");
+    Ok(())
+}
+
+fn cmd_budget_alerts(conn: &Connection) -> Result<()> {
+    let alerts = db::check_budget_alerts(conn);
+    if alerts.is_empty() {
+        println!("{}", "No budget alerts — all projects within daily limits.".green());
+        return Ok(());
+    }
+    println!("{}", "BUDGET ALERTS".bold().red());
+    for a in &alerts {
+        let p = a.project.split('/').last().unwrap_or(&a.project);
+        println!("  {} {} — ${:.2} / ${:.2} ({:.0}% over)",
+            "!".bold().red(), p.bold(), a.daily_spent, a.daily_limit,
+            (a.daily_spent - a.daily_limit) / a.daily_limit * 100.0);
+    }
+    Ok(())
+}
+
+fn cmd_set_budget(conn: &Connection, project: &str, limit: f64) -> Result<()> {
+    if project == "default" {
+        db::set_config(conn, "default_daily_budget", &limit.to_string())?;
+        println!("Default daily budget set to ${:.2}", limit);
+    } else {
+        let key = format!("budget_{}", project.replace('/', "_"));
+        db::set_config(conn, &key, &limit.to_string())?;
+        println!("Budget for {} set to ${:.2}", project, limit);
+    }
     Ok(())
 }

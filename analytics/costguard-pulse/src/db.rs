@@ -404,6 +404,149 @@ pub fn cost_anomalies(conn: &Connection, since: &str) -> Vec<CostAnomaly> {
     rows.filter_map(|r| r.ok()).collect()
 }
 
+// -----------------------------------------------------------------------
+// Fleet cost aggregation
+// -----------------------------------------------------------------------
+
+/// Per-host cost summary.
+pub struct HostCost {
+    pub hostname: String,
+    pub sessions: i64,
+    pub total_cost: f64,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
+    pub cache_hit_pct: f64,
+    pub projects: i64,
+}
+
+/// Aggregate costs by hostname (useful for multi-machine setups).
+pub fn fleet_costs(conn: &Connection, since: &str) -> Vec<HostCost> {
+    let mut stmt = conn.prepare(
+        "SELECT
+            COALESCE(hostname, '(local)') as host,
+            COUNT(*) as sessions,
+            COALESCE(SUM(total_cost_usd), 0.0) as total_cost,
+            COALESCE(SUM(total_input_tokens), 0) as input_tokens,
+            COALESCE(SUM(total_output_tokens), 0) as output_tokens,
+            COALESCE(SUM(total_cache_read), 0) as cache_read,
+            COALESCE(SUM(total_cache_write), 0) as cache_write,
+            COUNT(DISTINCT project) as projects
+         FROM sessions
+         WHERE started_at >= ?1
+         GROUP BY hostname
+         ORDER BY total_cost DESC"
+    ).unwrap();
+
+    let rows = stmt.query_map([since], |row| {
+        let cache_read: i64 = row.get(5)?;
+        let cache_write: i64 = row.get(6)?;
+        let input_tokens: i64 = row.get(3)?;
+        let total = cache_read + cache_write + input_tokens;
+        Ok(HostCost {
+            hostname: row.get(0)?,
+            sessions: row.get(1)?,
+            total_cost: row.get(2)?,
+            total_input_tokens: input_tokens,
+            total_output_tokens: row.get(4)?,
+            cache_hit_pct: if total > 0 { cache_read as f64 / total as f64 * 100.0 } else { 0.0 },
+            projects: row.get(7)?,
+        })
+    }).unwrap();
+
+    rows.filter_map(|r| r.ok()).collect()
+}
+
+// -----------------------------------------------------------------------
+// Efficiency scoring
+// -----------------------------------------------------------------------
+
+/// Efficiency metrics for a project.
+pub struct EfficiencyScore {
+    pub project: String,
+    pub tokens_per_commit: f64,
+    pub cost_per_commit: f64,
+    pub waste_ratio: f64,
+    pub cache_hit_rate: f64,
+    pub avg_session_cost: f64,
+}
+
+/// Calculate efficiency scores per project.
+pub fn efficiency_scores(conn: &Connection, since: &str) -> Vec<EfficiencyScore> {
+    let mut stmt = conn.prepare(
+        "SELECT
+            COALESCE(s.project, '(unknown)') as project,
+            COUNT(DISTINCT s.id) as sessions,
+            COALESCE(SUM(s.total_input_tokens + s.total_output_tokens + s.total_cache_read + s.total_cache_write), 0) as total_tokens,
+            COALESCE(SUM(s.total_output_tokens), 0) as output_tokens,
+            COALESCE(SUM(s.total_cache_read), 0) as cache_read,
+            COALESCE(SUM(s.total_input_tokens + s.total_cache_read + s.total_cache_write), 0) as input_total,
+            COALESCE(SUM(s.total_cost_usd), 0.0) as total_cost,
+            (SELECT COUNT(*) FROM commits c WHERE c.project = s.project AND c.timestamp >= ?1) as commit_count,
+            (SELECT COUNT(DISTINCT tu.session_id) FROM tool_usage tu JOIN sessions ss ON tu.session_id = ss.id WHERE ss.project = s.project AND ss.started_at >= ?1) as sessions_with_tools
+         FROM sessions s
+         WHERE s.started_at >= ?1
+         GROUP BY s.project
+         HAVING total_tokens > 0
+         ORDER BY total_cost DESC"
+    ).unwrap();
+
+    let rows = stmt.query_map([since], |row| {
+        let sessions: i64 = row.get(1)?;
+        let total_tokens: i64 = row.get(2)?;
+        let cache_read: i64 = row.get(4)?;
+        let input_total: i64 = row.get(5)?;
+        let total_cost: f64 = row.get(6)?;
+        let commits: i64 = row.get(7)?;
+        let sessions_with_tools: i64 = row.get(8)?;
+
+        Ok(EfficiencyScore {
+            project: row.get(0)?,
+            tokens_per_commit: if commits > 0 { total_tokens as f64 / commits as f64 } else { 0.0 },
+            cost_per_commit: if commits > 0 { total_cost / commits as f64 } else { 0.0 },
+            waste_ratio: if sessions > 0 { (sessions - sessions_with_tools) as f64 / sessions as f64 } else { 0.0 },
+            cache_hit_rate: if input_total > 0 { cache_read as f64 / input_total as f64 * 100.0 } else { 0.0 },
+            avg_session_cost: if sessions > 0 { total_cost / sessions as f64 } else { 0.0 },
+        })
+    }).unwrap();
+
+    rows.filter_map(|r| r.ok()).collect()
+}
+
+// -----------------------------------------------------------------------
+// Budget alerts
+// -----------------------------------------------------------------------
+
+/// Budget alert for a project exceeding daily spend.
+pub struct BudgetAlert {
+    pub project: String,
+    pub daily_limit: f64,
+    pub daily_spent: f64,
+    pub exceeded: bool,
+}
+
+/// Check per-project daily spend against configurable thresholds.
+pub fn check_budget_alerts(conn: &Connection) -> Vec<BudgetAlert> {
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let default_limit: f64 = get_config(conn, "default_daily_budget")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50.0);
+
+    let mut stmt = conn.prepare(
+        "SELECT COALESCE(project, '(unknown)'), COALESCE(SUM(total_cost_usd), 0.0)
+         FROM sessions WHERE started_at >= ?1 GROUP BY project ORDER BY 2 DESC"
+    ).unwrap();
+
+    let rows = stmt.query_map([&today], |row| {
+        let project: String = row.get(0)?;
+        let daily_spent: f64 = row.get(1)?;
+        let key = format!("budget_{}", project.replace('/', "_"));
+        let limit = get_config(conn, &key).and_then(|v| v.parse().ok()).unwrap_or(default_limit);
+        Ok(BudgetAlert { project, daily_limit: limit, daily_spent, exceeded: daily_spent > limit })
+    }).unwrap();
+
+    rows.filter_map(|r| r.ok()).filter(|a| a.exceeded).collect()
+}
+
 /// Budget warning: percentage of 5-hour window consumed.
 pub fn burst_window_pct(conn: &Connection) -> f64 {
     let budget = get_plan_budget(conn);
