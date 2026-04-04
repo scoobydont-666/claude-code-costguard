@@ -4,6 +4,25 @@
 
 Drop-in skills, hooks, and analytics for intelligent model routing, subagent delegation, and real-time cost tracking. Works with Max, Teams, and API plans.
 
+## Architecture
+
+```mermaid
+graph LR
+    A["Claude Code Session"] -->|subagent launches| B["token-miser-route.sh"]
+    B -->|Haiku/Sonnet/Opus| C["Routed Subagent"]
+    C -->|transcript| D["costguard-pulse"]
+    
+    A -->|session phases| E["session-miser Skill"]
+    E -->|plan/execute/review| F["Model + effort selection"]
+    
+    D -->|token analysis| G["Cost Analysis Engine"]
+    G -->|breakdown| H["Fleet Cost Aggregation"]
+    H -->|alerts| I["Budget Alerts"]
+    I -->|PDF/Excel| J["Reports"]
+    
+    K["Prompt Cache"] -.->|8x cheaper reads| D
+```
+
 ## The Numbers
 
 | Technique | Savings | How |
