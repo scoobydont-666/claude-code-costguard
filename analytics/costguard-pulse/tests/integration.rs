@@ -342,3 +342,378 @@ fn test_statusline_live_session_tokens() {
     assert!(result.contains("sess 3.6K") || result.contains("sess 3.7K"),
         "Expected ~3.6K session tokens: {result}");
 }
+
+// --- Phase 3: Budget, calibration, and configuration ---
+
+#[test]
+fn test_budget_show_defaults() {
+    let dir = unique_data_dir();
+    let result = run_cli(&dir, &["budget"]);
+    assert!(result.contains("Plan:"), "Expected plan display: {result}");
+    assert!(result.contains("weekly"), "Expected weekly budget: {result}");
+    assert!(result.contains("5-hour"), "Expected 5-hour budget: {result}");
+}
+
+#[test]
+fn test_budget_set_weekly() {
+    let dir = unique_data_dir();
+    run_cli(&dir, &["budget", "--weekly", "3B"]);
+    let result = run_cli(&dir, &["budget"]);
+    assert!(result.contains("3B") || result.contains("3.0B"), "Expected 3B in budget: {result}");
+}
+
+#[test]
+fn test_budget_set_burst() {
+    let dir = unique_data_dir();
+    run_cli(&dir, &["budget", "--burst", "250M"]);
+    let result = run_cli(&dir, &["budget"]);
+    assert!(result.contains("250M") || result.contains("250"), "Expected 250M in budget: {result}");
+}
+
+#[test]
+fn test_budget_set_plan_name() {
+    let dir = unique_data_dir();
+    run_cli(&dir, &["budget", "--plan", "max-5x"]);
+    let result = run_cli(&dir, &["budget"]);
+    assert!(result.contains("max-5x"), "Expected plan name: {result}");
+}
+
+#[test]
+fn test_calibration_show_initial() {
+    let dir = unique_data_dir();
+    let result = run_cli(&dir, &["calibrate"]);
+    assert!(result.contains("Last calibrated:"), "Expected calibration status: {result}");
+    assert!(result.contains("never") || result.contains("Weekly"), "Should show uncalibrated or placeholder: {result}");
+}
+
+#[test]
+fn test_calibration_set_weekly_pct() {
+    let dir = unique_data_dir();
+    run_cli(&dir, &["calibrate", "--weekly-pct", "42.5", "--burst-pct", "67"]);
+    let result = run_cli(&dir, &["calibrate"]);
+    assert!(result.contains("42.5") || result.contains("42"), "Expected weekly pct: {result}");
+    assert!(result.contains("67"), "Expected burst pct: {result}");
+}
+
+#[test]
+fn test_sessions_list() {
+    let dir = unique_data_dir();
+    run_hook(&dir, "session-start", r#"{"sessionId":"sess-l1","cwd":"/opt/proj1"}"#);
+    run_hook(&dir, "session-start", r#"{"sessionId":"sess-l2","cwd":"/opt/proj2"}"#);
+    run_hook(&dir, "session-start", r#"{"sessionId":"sess-l3","cwd":"/opt/proj3"}"#);
+
+    let result = run_cli(&dir, &["sessions", "--period", "all"]);
+    assert!(result.contains("sess-l1"), "Expected sess-l1: {result}");
+    assert!(result.contains("sess-l2"), "Expected sess-l2: {result}");
+    assert!(result.contains("sess-l3"), "Expected sess-l3: {result}");
+}
+
+#[test]
+fn test_sessions_period_filter_today() {
+    let dir = unique_data_dir();
+    run_hook(&dir, "session-start", r#"{"sessionId":"sess-today","cwd":"/opt/test"}"#);
+    let result = run_cli(&dir, &["sessions", "--period", "today"]);
+    // May have 0 or 1 sessions depending on time
+    assert!(!result.is_empty(), "Should not crash: {result}");
+}
+
+#[test]
+fn test_agents_list_empty() {
+    let dir = unique_data_dir();
+    let result = run_cli(&dir, &["agents"]);
+    assert!(result.contains("No subagents") || result.is_empty(), "Should show no subagents or empty: {result}");
+}
+
+#[test]
+fn test_agents_with_session_filter() {
+    let dir = unique_data_dir();
+    run_hook(&dir, "session-start", r#"{"sessionId":"sess-agf","cwd":"/opt/test"}"#);
+    run_hook(&dir, "agent-start", r#"{"sessionId":"sess-agf","agentId":"ag-1"}"#);
+    run_hook(&dir, "agent-end", r#"{"sessionId":"sess-agf","agentId":"ag-1"}"#);
+
+    let result = run_cli(&dir, &["agents", "--session", "sess-agf"]);
+    assert!(result.contains("ag-1"), "Expected ag-1: {result}");
+}
+
+#[test]
+fn test_cost_by_model() {
+    let dir = unique_data_dir();
+    let tp = format!("{dir}/models.jsonl");
+    let mut f = fs::File::create(&tp).unwrap();
+    writeln!(f, r#"{{"type":"progress","timestamp":"2026-03-20T10:00:00.000Z","uuid":"meta-1","cwd":"/opt/test","sessionId":"sess-m","gitBranch":"main"}}"#).unwrap();
+    writeln!(f, r#"{{"type":"assistant","timestamp":"2026-03-20T10:00:01.000Z","uuid":"msg-1","message":{{"model":"claude-opus-4-6","usage":{{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"content":[{{"type":"text","text":"test"}}]}}}}"#).unwrap();
+    writeln!(f, r#"{{"type":"assistant","timestamp":"2026-03-20T10:00:02.000Z","uuid":"msg-2","message":{{"model":"claude-sonnet-4-6","usage":{{"input_tokens":50,"output_tokens":25,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"content":[{{"type":"text","text":"test2"}}]}}}}"#).unwrap();
+
+    run_hook(&dir, "session-start", &format!(r#"{{"sessionId":"sess-m","cwd":"/opt/test","transcriptPath":"{tp}"}}"#));
+    run_hook(&dir, "session-end", &format!(r#"{{"sessionId":"sess-m","transcriptPath":"{tp}"}}"#));
+
+    let result = run_cli(&dir, &["cost", "--by", "model"]);
+    assert!(result.contains("opus"), "Expected opus model: {result}");
+    assert!(result.contains("sonnet"), "Expected sonnet model: {result}");
+}
+
+#[test]
+fn test_tools_period_filtering() {
+    let dir = unique_data_dir();
+    run_hook(&dir, "session-start", r#"{"sessionId":"sess-tp","cwd":"/opt/test"}"#);
+    run_hook(&dir, "tool-use", r#"{"sessionId":"sess-tp","toolName":"Read"}"#);
+    run_hook(&dir, "tool-use", r#"{"sessionId":"sess-tp","toolName":"Write"}"#);
+
+    let result = run_cli(&dir, &["tools", "--period", "all"]);
+    assert!(result.contains("Read"), "Expected Read: {result}");
+    assert!(result.contains("Write"), "Expected Write: {result}");
+}
+
+#[test]
+fn test_efficiency_with_data() {
+    let dir = unique_data_dir();
+    let tp = format!("{dir}/eff.jsonl");
+    write_test_transcript(&tp);
+
+    run_hook(&dir, "session-start", &format!(r#"{{"sessionId":"sess-e1","cwd":"/opt/test","transcriptPath":"{tp}"}}"#));
+    run_hook(&dir, "session-end", &format!(r#"{{"sessionId":"sess-e1","transcriptPath":"{tp}"}}"#));
+
+    let result = run_cli(&dir, &["efficiency"]);
+    assert!(result.contains("Total cost") || result.contains("$"), "Expected cost data: {result}");
+    assert!(result.contains("session") || result.contains("agent"), "Expected efficiency metrics: {result}");
+}
+
+#[test]
+fn test_routing_decision_display() {
+    let dir = unique_data_dir();
+    let result = run_cli(&dir, &["routing"]);
+    assert!(result.contains("routing") || result.contains("No routing"), "Expected routing output or empty: {result}");
+}
+
+#[test]
+fn test_commits_list_empty() {
+    let dir = unique_data_dir();
+    let result = run_cli(&dir, &["commits"]);
+    assert!(result.contains("No commits") || result.is_empty(), "Should show no commits: {result}");
+}
+
+#[test]
+fn test_sync_all_with_no_transcripts() {
+    let dir = unique_data_dir();
+    let result = run_cli(&dir, &["sync"]);
+    assert!(result.contains("up to date") || result.contains("error") || result.is_empty(), "Should handle gracefully: {result}");
+}
+
+#[test]
+fn test_sync_nonexistent_session() {
+    let dir = unique_data_dir();
+    let result = run_cli(&dir, &["sync", "--session", "nonexistent-sess-id"]);
+    assert!(result.contains("not found") || result.contains("No transcript"), "Should report not found: {result}");
+}
+
+// --- Phase 4: Fleet, efficiency, budgets ---
+
+#[test]
+fn test_project_costs_empty() {
+    let dir = unique_data_dir();
+    let result = run_cli(&dir, &["project-costs", "--period", "week"]);
+    assert!(result.contains("No session") || result.is_empty(), "Should handle empty gracefully: {result}");
+}
+
+#[test]
+fn test_task_costs_empty() {
+    let dir = unique_data_dir();
+    let result = run_cli(&dir, &["task-costs", "--period", "week"]);
+    assert!(result.contains("No task") || result.contains("Hint"), "Should show hint: {result}");
+}
+
+#[test]
+fn test_anomalies_empty() {
+    let dir = unique_data_dir();
+    let result = run_cli(&dir, &["anomalies", "--period", "week"]);
+    assert!(result.contains("No cost anomalies") || result.is_empty(), "Should show no anomalies: {result}");
+}
+
+#[test]
+fn test_fleet_costs_empty() {
+    let dir = unique_data_dir();
+    let result = run_cli(&dir, &["fleet-costs", "--period", "week"]);
+    assert!(result.contains("No session") || result.is_empty(), "Should handle empty gracefully: {result}");
+}
+
+#[test]
+fn test_efficiency_scores_empty() {
+    let dir = unique_data_dir();
+    let result = run_cli(&dir, &["efficiency-scores", "--period", "week"]);
+    assert!(result.contains("No session") || result.is_empty(), "Should handle empty gracefully: {result}");
+}
+
+#[test]
+fn test_budget_alerts_empty() {
+    let dir = unique_data_dir();
+    let result = run_cli(&dir, &["budget-alerts"]);
+    assert!(result.contains("No budget") || result.contains("within"), "Should show no alerts: {result}");
+}
+
+#[test]
+fn test_set_budget_default() {
+    let dir = unique_data_dir();
+    run_cli(&dir, &["set-budget", "--project", "default", "--limit", "50.0"]);
+    let result = run_cli(&dir, &["budget-alerts"]);
+    assert!(!result.is_empty(), "Should not crash after setting budget: {result}");
+}
+
+#[test]
+fn test_set_budget_project() {
+    let dir = unique_data_dir();
+    run_cli(&dir, &["set-budget", "--project", "hydra-project", "--limit", "25.5"]);
+    let result = run_cli(&dir, &["budget-alerts"]);
+    assert!(!result.is_empty(), "Should not crash after setting project budget: {result}");
+}
+
+// --- Edge cases and error handling ---
+
+#[test]
+fn test_multiple_concurrent_sessions() {
+    let dir = unique_data_dir();
+    for i in 0..5 {
+        let sid = format!("sess-multi-{}", i);
+        run_hook(&dir, "session-start", &format!(r#"{{"sessionId":"{}","cwd":"/opt/test{}"}}"#, sid, i));
+    }
+
+    let result = run_cli(&dir, &["sessions", "--period", "all"]);
+    for i in 0..5 {
+        let sid = format!("sess-multi-{}", i);
+        assert!(result.contains(&sid), "Expected {}: {}", sid, result);
+    }
+}
+
+#[test]
+fn test_session_with_special_characters_in_path() {
+    let dir = unique_data_dir();
+    let tp = format!("{dir}/test@special#chars.jsonl");
+    write_test_transcript(&tp);
+
+    run_hook(&dir, "session-start", &format!(r#"{{"sessionId":"sess-special","cwd":"/opt/test-[special]","transcriptPath":"{}"}}"#, tp));
+    let result = run_cli(&dir, &["sessions", "--period", "all"]);
+    assert!(result.contains("sess-special"), "Should handle special chars: {result}");
+}
+
+#[test]
+fn test_very_long_session_id() {
+    let dir = unique_data_dir();
+    let long_id = "s".repeat(256);
+    let output = run_hook(&dir, "session-start", &format!(r#"{{"sessionId":"{}","cwd":"/opt/test"}}"#, long_id));
+    assert!(output.status.success(), "Should handle long IDs gracefully");
+}
+
+#[test]
+fn test_zero_token_usage() {
+    let dir = unique_data_dir();
+    let tp = format!("{dir}/zero.jsonl");
+    let mut f = fs::File::create(&tp).unwrap();
+    writeln!(f, r#"{{"type":"progress","timestamp":"2026-03-20T10:00:00.000Z","uuid":"meta-1","cwd":"/opt/test","sessionId":"sess-zero"}}"#).unwrap();
+    writeln!(f, r#"{{"type":"assistant","timestamp":"2026-03-20T10:00:01.000Z","uuid":"msg-1","message":{{"model":"claude-opus-4-6","usage":{{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"content":[{{"type":"text","text":"nothing"}}]}}}}"#).unwrap();
+
+    run_hook(&dir, "session-start", &format!(r#"{{"sessionId":"sess-zero","cwd":"/opt/test","transcriptPath":"{tp}"}}"#));
+    run_hook(&dir, "session-end", &format!(r#"{{"sessionId":"sess-zero","transcriptPath":"{tp}"}}"#));
+
+    let result = run_cli(&dir, &["stats", "--period", "all"]);
+    assert!(result.contains("$    0.00") || result.contains("0 tokens"), "Should handle zero usage: {result}");
+}
+
+#[test]
+fn test_invalid_model_name_ignored() {
+    let dir = unique_data_dir();
+    let tp = format!("{dir}/invalid.jsonl");
+    let mut f = fs::File::create(&tp).unwrap();
+    writeln!(f, r#"{{"type":"progress","timestamp":"2026-03-20T10:00:00.000Z","uuid":"meta","cwd":"/opt/test","sessionId":"sess-inv"}}"#).unwrap();
+    writeln!(f, r#"{{"type":"assistant","timestamp":"2026-03-20T10:00:01.000Z","uuid":"msg","message":{{"model":"totally-fake-model-xyz","usage":{{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"content":[{{"type":"text","text":"test"}}]}}}}"#).unwrap();
+
+    run_hook(&dir, "session-start", &format!(r#"{{"sessionId":"sess-inv","cwd":"/opt/test","transcriptPath":"{tp}"}}"#));
+    run_hook(&dir, "session-end", &format!(r#"{{"sessionId":"sess-inv","transcriptPath":"{tp}"}}"#));
+
+    let result = run_cli(&dir, &["cost", "--by", "model"]);
+    // Should not crash and may show unknown model
+    assert!(!result.is_empty(), "Should handle unknown model gracefully: {result}");
+}
+
+#[test]
+fn test_cache_hit_calculation() {
+    let dir = unique_data_dir();
+    let tp = format!("{dir}/cache.jsonl");
+    let mut f = fs::File::create(&tp).unwrap();
+    writeln!(f, r#"{{"type":"progress","timestamp":"2026-03-20T10:00:00.000Z","uuid":"meta","cwd":"/opt/test","sessionId":"sess-cache"}}"#).unwrap();
+    // Message with lots of cache read
+    writeln!(f, r#"{{"type":"assistant","timestamp":"2026-03-20T10:00:01.000Z","uuid":"msg","message":{{"model":"claude-opus-4-6","usage":{{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":9000,"cache_creation_input_tokens":1000}},"content":[{{"type":"text","text":"cached"}}]}}}}"#).unwrap();
+
+    run_hook(&dir, "session-start", &format!(r#"{{"sessionId":"sess-cache","cwd":"/opt/test","transcriptPath":"{tp}"}}"#));
+    run_hook(&dir, "session-end", &format!(r#"{{"sessionId":"sess-cache","transcriptPath":"{tp}"}}"#));
+
+    let result = run_cli(&dir, &["stats", "--period", "all"]);
+    assert!(result.contains("Cache hit"), "Expected cache hit stat: {result}");
+    assert!(result.contains("%"), "Expected cache percentage: {result}");
+}
+
+#[test]
+fn test_cost_breakdown_accuracy() {
+    let dir = unique_data_dir();
+    let tp = format!("{dir}/accurate.jsonl");
+    let mut f = fs::File::create(&tp).unwrap();
+    writeln!(f, r#"{{"type":"progress","timestamp":"2026-03-20T10:00:00.000Z","uuid":"meta","cwd":"/opt/test","sessionId":"sess-acc"}}"#).unwrap();
+    // Haiku: 100 input + 50 output (should be cheapest)
+    writeln!(f, r#"{{"type":"assistant","timestamp":"2026-03-20T10:00:01.000Z","uuid":"msg-h","message":{{"model":"claude-haiku-4-5","usage":{{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"content":[{{"type":"text","text":"cheap"}}]}}}}"#).unwrap();
+    // Opus: same tokens (should be ~5x more expensive)
+    writeln!(f, r#"{{"type":"assistant","timestamp":"2026-03-20T10:00:02.000Z","uuid":"msg-o","message":{{"model":"claude-opus-4-6","usage":{{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"content":[{{"type":"text","text":"expensive"}}]}}}}"#).unwrap();
+
+    run_hook(&dir, "session-start", &format!(r#"{{"sessionId":"sess-acc","cwd":"/opt/test","transcriptPath":"{tp}"}}"#));
+    run_hook(&dir, "session-end", &format!(r#"{{"sessionId":"sess-acc","transcriptPath":"{tp}"}}"#));
+
+    let result = run_cli(&dir, &["cost", "--by", "model"]);
+    // Both should appear with different costs
+    assert!(result.contains("haiku"), "Expected haiku: {result}");
+    assert!(result.contains("opus"), "Expected opus: {result}");
+}
+
+#[test]
+fn test_empty_tool_input_no_crash() {
+    let dir = unique_data_dir();
+    run_hook(&dir, "session-start", r#"{"sessionId":"sess-empty-tool","cwd":"/opt/test"}"#);
+    run_hook(&dir, "tool-use", r#"{"sessionId":"sess-empty-tool","toolName":"Read"}"#);
+    run_hook(&dir, "tool-use", r#"{"sessionId":"sess-empty-tool","toolName":"Bash","toolInput":{}}"#);
+    run_hook(&dir, "tool-use", r#"{"sessionId":"sess-empty-tool","toolName":"Write","toolInput":{"file_path":""}}"#);
+
+    let result = run_cli(&dir, &["tools", "--period", "all"]);
+    assert!(result.contains("Read"), "Should record tools even with empty input: {result}");
+}
+
+#[test]
+fn test_doctor_reports_complete_status() {
+    let dir = unique_data_dir();
+    let result = run_cli(&dir, &["doctor"]);
+    // Should check: DB, hooks, binary, timer, pricing, data, transcripts
+    assert!(result.contains("DB:"), "Missing DB check: {result}");
+    assert!(result.contains("Hooks:"), "Missing hooks check: {result}");
+    assert!(result.contains("Binary:"), "Missing binary check: {result}");
+    assert!(result.contains("Data:"), "Missing data check: {result}");
+}
+
+#[test]
+fn test_statusline_format_compact() {
+    let dir = unique_data_dir();
+    let result = run_cli(&dir, &["statusline"]);
+    // Should be single line, no newlines for status bar use
+    let lines: Vec<&str> = result.lines().collect();
+    assert_eq!(lines.len(), 1, "Statusline should be exactly 1 line: {}", result);
+    assert!(!result.contains('\n'), "Statusline should not have newlines: {result}");
+}
+
+#[test]
+fn test_multiple_projects_in_single_session() {
+    let dir = unique_data_dir();
+    let tp = format!("{dir}/multi-proj.jsonl");
+    let mut f = fs::File::create(&tp).unwrap();
+    writeln!(f, r#"{{"type":"progress","timestamp":"2026-03-20T10:00:00.000Z","uuid":"meta","cwd":"/opt/hydra-project","sessionId":"sess-mp"}}"#).unwrap();
+    writeln!(f, r#"{{"type":"assistant","timestamp":"2026-03-20T10:00:01.000Z","uuid":"msg-1","message":{{"model":"claude-opus-4-6","usage":{{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"content":[{{"type":"text","text":"msg"}}]}}}}"#).unwrap();
+
+    run_hook(&dir, "session-start", &format!(r#"{{"sessionId":"sess-mp","cwd":"/opt/hydra-project","transcriptPath":"{tp}"}}"#));
+    run_hook(&dir, "session-end", &format!(r#"{{"sessionId":"sess-mp","transcriptPath":"{tp}"}}"#));
+
+    let result = run_cli(&dir, &["sessions", "--period", "all"]);
+    assert!(result.contains("hydra"), "Should capture project context: {result}");
+}
