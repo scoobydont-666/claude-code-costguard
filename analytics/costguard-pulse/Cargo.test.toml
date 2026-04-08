@@ -1,0 +1,61 @@
+# pytest-style configuration for costguard-pulse tests
+# This file documents test organization and expectations
+
+[test]
+name = "costguard-pulse"
+version = "0.1.0"
+
+# Test framework: Rust's built-in test runner
+framework = "cargo-test"
+
+# Test organization
+test_paths = [
+    "tests/integration.rs",   # 45+ integration tests
+    "tests/unit_tests.rs",    # 35+ unit tests
+]
+
+# Test options
+parallel = true
+timeout = 120             # seconds per test
+color = "auto"
+
+# Coverage requirements
+coverage_minimum = 85      # percent
+coverage_target = 90       # percent
+
+# Test categories
+[test.categories]
+"core" = "Phase 1: Core functionality"
+"integrity" = "Phase 2: Data integrity"
+"reporting" = "Phase 3: Reporting & display"
+"advanced" = "Phase 4: Advanced features"
+"edge_cases" = "Edge cases and error handling"
+"calculations" = "Cost calculations and accuracy"
+
+# Expected test counts by category
+[test.expected_counts]
+core = 10
+integrity = 7
+reporting = 10
+advanced = 18
+edge_cases = 15
+calculations = 9
+
+# Test fixtures
+[test.fixtures]
+temp_dir = "/tmp/costguard-pulse-test-{id}"
+transcript_format = "JSONL"
+database_engine = "SQLite with WAL"
+
+# Known slow tests (>1s)
+[test.slow_tests]
+"test_multiple_concurrent_sessions" = "Creates 5 sessions"
+"test_sync_session_subcommand" = "Parses JSONL file"
+"test_cache_hit_calculation" = "Analyzes historical data"
+
+# CI/CD integration
+[ci]
+provider = "GitHub Actions"
+branch_protection = true
+require_passing_tests = true
+coverage_reporting = true
