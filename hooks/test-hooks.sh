@@ -166,8 +166,8 @@ else
 fi
 
 run_test "settings-snippet.json has required hooks"
-local hooks=("session-start" "session-end" "tool-use" "agent-start" "agent-end")
-local snippet=$(cat "${SCRIPT_DIR}/../config/settings-snippet.json")
+hooks=("session-start" "session-end" "tool-use" "agent-start" "agent-end")
+snippet=$(cat "${SCRIPT_DIR}/../config/settings-snippet.json")
 for hook in "${hooks[@]}"; do
     if echo "$snippet" | grep -q "$hook"; then
         echo -e "${GREEN}✓ Hook configured: $hook${NC}"
@@ -224,8 +224,8 @@ run_test "LICENSE is MIT"
 assert_contains "$(cat ${SCRIPT_DIR}/../LICENSE)" "MIT" "MIT license present"
 
 run_test "No hardcoded secrets in source"
-local secret_patterns=("api_key" "APIKEY" "secret=" "password=" "token=" "127.0.0.1" "localhost")
-local found_secrets=0
+secret_patterns=("api_key" "APIKEY" "secret=" "password=" "token=" "127.0.0.1" "localhost")
+found_secrets=0
 for pattern in "${secret_patterns[@]}"; do
     if grep -r "$pattern" "${SCRIPT_DIR}/../hooks/" 2>/dev/null | grep -v "localhost" | grep -v "127.0.0.1" | head -1; then
         echo -e "${YELLOW}⚠ Potential secret found: $pattern${NC}"
@@ -242,7 +242,7 @@ fi
 # ============================================================================
 
 run_test "Dependencies documented in README"
-local deps=("jq" "bc" "cargo" "budi")
+deps=("jq" "bc" "cargo" "budi")
 for dep in "${deps[@]}"; do
     if grep -q "$dep" "${SCRIPT_DIR}/../README.md"; then
         echo -e "${GREEN}✓ Dependency documented: $dep${NC}"
