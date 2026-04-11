@@ -708,12 +708,12 @@ fn test_multiple_projects_in_single_session() {
     let dir = unique_data_dir();
     let tp = format!("{dir}/multi-proj.jsonl");
     let mut f = fs::File::create(&tp).unwrap();
-    writeln!(f, r#"{{"type":"progress","timestamp":"2026-03-20T10:00:00.000Z","uuid":"meta","cwd":"/opt/hydra-project","sessionId":"sess-mp"}}"#).unwrap();
+    writeln!(f, r#"{{"type":"progress","timestamp":"2026-03-20T10:00:00.000Z","uuid":"meta","cwd":"/home/user/my-project","sessionId":"sess-mp"}}"#).unwrap();
     writeln!(f, r#"{{"type":"assistant","timestamp":"2026-03-20T10:00:01.000Z","uuid":"msg-1","message":{{"model":"claude-opus-4-6","usage":{{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"content":[{{"type":"text","text":"msg"}}]}}}}"#).unwrap();
 
-    run_hook(&dir, "session-start", &format!(r#"{{"sessionId":"sess-mp","cwd":"/opt/hydra-project","transcriptPath":"{tp}"}}"#));
+    run_hook(&dir, "session-start", &format!(r#"{{"sessionId":"sess-mp","cwd":"/home/user/my-project","transcriptPath":"{tp}"}}"#));
     run_hook(&dir, "session-end", &format!(r#"{{"sessionId":"sess-mp","transcriptPath":"{tp}"}}"#));
 
     let result = run_cli(&dir, &["sessions", "--period", "all"]);
-    assert!(result.contains("hydra"), "Should capture project context: {result}");
+    assert!(result.contains("my-project"), "Should capture project context: {result}");
 }
