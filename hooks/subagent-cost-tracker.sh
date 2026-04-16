@@ -24,13 +24,16 @@ MODEL="unknown"
 
 if [[ -n "$TRANSCRIPT_PATH" && -f "$TRANSCRIPT_PATH" ]]; then
     # Parse JSONL transcript for usage data — sum all usage entries
+    # Usage is nested at .message.usage (not top-level .usage)
     USAGE=$(jq -s '
-        [.[] | select(.usage) | .usage] |
+        [.[] | select(.message.usage) | .message.usage] |
         {
             input_tokens: (map(.input_tokens // 0) | add // 0),
-            output_tokens: (map(.output_tokens // 0) | add // 0)
+            output_tokens: (map(.output_tokens // 0) | add // 0),
+            cache_read_input_tokens: (map(.cache_read_input_tokens // 0) | add // 0),
+            cache_creation_input_tokens: (map(.cache_creation_input_tokens // 0) | add // 0)
         }
-    ' "$TRANSCRIPT_PATH" 2>/dev/null || echo '{"input_tokens":0,"output_tokens":0}')
+    ' "$TRANSCRIPT_PATH" 2>/dev/null || echo '{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}')
 
     INPUT_TOKENS=$(echo "$USAGE" | jq -r '.input_tokens // 0')
     OUTPUT_TOKENS=$(echo "$USAGE" | jq -r '.output_tokens // 0')
@@ -38,8 +41,8 @@ if [[ -n "$TRANSCRIPT_PATH" && -f "$TRANSCRIPT_PATH" ]]; then
     [[ "$INPUT_TOKENS" =~ ^[0-9]+$ ]] || INPUT_TOKENS=0
     [[ "$OUTPUT_TOKENS" =~ ^[0-9]+$ ]] || OUTPUT_TOKENS=0
 
-    # Extract model from first assistant message
-    MODEL=$(jq -r 'select(.model) | .model' "$TRANSCRIPT_PATH" 2>/dev/null | head -1 || echo "unknown")
+    # Extract model from first assistant message (nested at .message.model)
+    MODEL=$(jq -r 'select(.message.model) | .message.model' "$TRANSCRIPT_PATH" 2>/dev/null | head -1 || echo "unknown")
     if [[ -z "$MODEL" || "$MODEL" == "null" ]]; then
         MODEL="unknown"
     fi
