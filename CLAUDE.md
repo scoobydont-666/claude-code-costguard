@@ -1,5 +1,11 @@
 # CostGuard — Claude Code Cost Optimization Toolkit
 
+## Status
+- `status: PUBLIC-RELEASED`
+- `last_verified: 2026-04-17`
+- `owner: josh`
+- `tier: infra`
+
 ## Project Location
 /opt/claude-code-costguard
 
