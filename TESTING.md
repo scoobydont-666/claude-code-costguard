@@ -1,5 +1,25 @@
 # CostGuard Testing Guide
 
+## Honest Current State (2026-04-18)
+
+- **Integration tests** (`tests/integration.rs`): 57 defined, **55 pass, 2 fail**.
+  The 2 failing tests assume an isolated fixture directory; they regress when
+  run in an env that has real Claude transcript data (they try to discover a
+  "no transcripts" baseline and find real ones). Fix requires switching to
+  tmpdir-rooted fixtures. Tracked as a `known_failing` category below.
+- **Unit tests** (`tests/unit_tests.rs`): 25 defined — most are **documentation
+  placeholders** (trivial `assert_eq!(x, x)` to describe expected behavior).
+  They pass but do not exercise real parsing/calculation paths.
+- **Hook tests** (`hooks/test-hooks.sh`): shell-only static checks. No CI.
+- **CI**: `.github/workflows/security.yml` runs gitleaks only. Test runs are
+  not wired into CI.
+
+So the earlier "70+ tests" / "~89% coverage" table was aspirational-tense
+prose, not measurements. The real shipping invariants are: 55 integration
+tests pass, and the binaries build cleanly.
+
+---
+
 ## Quick Start
 
 Run all tests:
@@ -11,9 +31,9 @@ Run all tests:
 Run specific test suite:
 
 ```bash
-./run-tests.sh --integration  # 45+ integration tests
-./run-tests.sh --units        # 35+ unit tests
-./run-tests.sh --hooks        # Shell script tests
+./run-tests.sh --integration  # 57 tests (55 pass, 2 need isolated fixtures)
+./run-tests.sh --units        # 25 placeholder tests (docs-as-tests)
+./run-tests.sh --hooks        # Shell script tests (static checks)
 ```
 
 Run with verbose output:
@@ -26,7 +46,7 @@ Run with verbose output:
 
 ## Test Structure
 
-### 1. Integration Tests (45+)
+### 1. Integration Tests (57)
 
 **Location**: `analytics/costguard-pulse/tests/integration.rs`
 
@@ -48,16 +68,21 @@ cargo test --test integration
 - **Phase 3** (10 tests): Reporting and display
 - **Phase 4** (18 tests): Advanced features and edge cases
 
-### 2. Unit Tests (35+)
+### 2. Unit Tests (25, placeholder)
 
 **Location**: `analytics/costguard-pulse/tests/unit_tests.rs`
 
-Tests isolated functions:
+Intended to test isolated functions:
 - Token parsing and formatting
 - Cost calculations
 - Timestamp handling
 - Buffer overflow prevention
 - SQL injection prevention
+
+**Current reality:** these 25 tests describe expected behavior in comments
+but assert tautologies (e.g. `assert_eq!(500_000_000, 500_000_000)`). They
+exist to document the parse/calc contract and should be rewritten to call
+the actual functions once those are exposed from `main.rs`.
 
 **Run**:
 ```bash
@@ -93,22 +118,23 @@ bash hooks/test-hooks.sh
 
 ## Test Coverage
 
-| Area | Tests | Coverage |
-|------|-------|----------|
-| Session management | 8 | 90% |
-| Transcript parsing | 6 | 95% |
-| Cost calculations | 9 | 92% |
-| Reporting | 10 | 88% |
-| Budget/calibration | 8 | 85% |
-| Edge cases | 15 | 80% |
-| Error handling | 10 | 85% |
-| **Total** | **70+** | **~89%** |
+The prior table here claimed measured coverage (~89%). CostGuard does not
+currently have `cargo-tarpaulin` or `cargo-llvm-cov` wired, so any coverage
+number was unsubstantiated. Raw test counts per suite:
+
+| Suite | Count | Passing | Notes |
+|-------|-------|---------|-------|
+| Integration (`tests/integration.rs`) | 57 | 55 | 2 fail when real transcripts exist in $XDG_DATA_HOME |
+| Unit (`tests/unit_tests.rs`) | 25 | 25 | Placeholders — tautological asserts |
+| Hooks (`hooks/test-hooks.sh`) | N/A | — | Static checks, no assertions beyond existence/executability |
+| **Total** | **82** | **80** | 2 flakes on real-data envs |
 
 ---
 
 ## Performance
 
-All 70+ tests complete in **60-90 seconds** on modern hardware.
+The 80 currently-passing tests complete in about 180 seconds on an i5-8500
+(parallel execution enabled).
 
 ### Test Timing
 
@@ -166,16 +192,22 @@ Tests handle:
 
 ## Continuous Integration
 
-### GitHub Actions
+### GitHub Actions (current)
 
-CI automatically runs all tests on:
+`.github/workflows/security.yml` runs **gitleaks only**. There is no
+test-runner workflow yet. The claims below are a ROADMAP, not shipping
+state — see the "Honest Current State" section at the top of this file.
+
+### Test-runner CI (planned)
+
+CI should run all tests on:
 - Every push to any branch
 - Every pull request
 
-**Required for merge**:
-- All integration tests pass
-- All unit tests pass
-- Code coverage ≥85%
+Intended merge gates:
+- All integration tests pass (57/57 — requires tmpdir fixture fix first)
+- All unit tests pass AND exercise real functions (not placeholders)
+- Code coverage measured via `cargo-llvm-cov`, not hand-waved
 
 ### Local Pre-Commit
 
@@ -300,4 +332,4 @@ Test suite is MIT licensed (same as CostGuard).
 
 ## Questions?
 
-See `TEST_SUITE.md` for detailed documentation of all 70+ tests.
+See `TEST_SUITE.md` for detailed per-test documentation (82 tests defined).

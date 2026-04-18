@@ -1,11 +1,27 @@
 # CostGuard Test Suite Documentation
 
-**Date**: 2026-04-08  
-**Coverage**: Comprehensive test suite for Claude Code CostGuard toolkit
+**Date**: 2026-04-18 (truth-up)
+**Coverage**: 82 tests defined across integration + unit + hook suites.
+
+> **Read first:** see `TESTING.md` → "Honest Current State" for the short
+> version. This file enumerates every test by name, but the summary counts
+> below should be treated as shipping truth:
+>
+> - Integration (`tests/integration.rs`): **57 defined, 55 pass, 2 fail**
+>   on envs with real Claude transcript data (fixture-isolation bug).
+> - Unit (`tests/unit_tests.rs`): **25 defined, 25 pass — all are
+>   documentation-style placeholders (tautological asserts)**. Rewriting
+>   them to exercise real functions is the path to real unit coverage.
+> - Hooks (`hooks/test-hooks.sh`): static checks, no assertion framework.
+>
+> Earlier versions of this document quoted "70+ tests / ~89% coverage".
+> Those numbers came from design intent, not measurement. They are left
+> in this file for traceability only.
 
 ## Overview
 
-This test suite provides **40+ integration tests** and **35+ unit tests** for costguard-pulse (Rust CLI) plus test documentation for shell hooks and skills.
+Suite enumerates behavior across costguard-pulse (Rust CLI) and test
+documentation for shell hooks and skills.
 
 **Goal**: Ensure CostGuard works reliably across session types, edge cases, and deployment scenarios.
 
