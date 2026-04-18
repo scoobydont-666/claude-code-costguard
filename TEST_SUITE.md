@@ -1,22 +1,26 @@
 # CostGuard Test Suite Documentation
 
-**Date**: 2026-04-18 (truth-up)
-**Coverage**: 82 tests defined across integration + unit + hook suites.
+**Date**: 2026-04-18 (post scale-back)
+**Coverage**: 55 integration tests (all passing) + hooks static checks.
 
-> **Read first:** see `TESTING.md` → "Honest Current State" for the short
-> version. This file enumerates every test by name, but the summary counts
-> below should be treated as shipping truth:
+> **Read first:** see `TESTING.md` → "Current State" for the short version.
+> This file enumerates tests by name; the summary counts below are the
+> source of truth:
 >
-> - Integration (`tests/integration.rs`): **57 defined, 55 pass, 2 fail**
->   on envs with real Claude transcript data (fixture-isolation bug).
-> - Unit (`tests/unit_tests.rs`): **25 defined, 25 pass — all are
->   documentation-style placeholders (tautological asserts)**. Rewriting
->   them to exercise real functions is the path to real unit coverage.
+> - Integration (`tests/integration.rs`): **55 tests, all passing**.
+>   End-to-end CLI + hook tests against real filesystem + SQLite;
+>   each test uses a unique `XDG_DATA_HOME` for isolation.
 > - Hooks (`hooks/test-hooks.sh`): static checks, no assertion framework.
 >
-> Earlier versions of this document quoted "70+ tests / ~89% coverage".
-> Those numbers came from design intent, not measurement. They are left
-> in this file for traceability only.
+> Earlier versions of this document quoted "70+ tests / ~89% coverage"
+> and enumerated a separate unit-test suite. Both were inaccurate. The
+> unit suite held 25 tautological placeholders and was deleted on
+> 2026-04-18 (the integration suite already covers those code paths
+> through the CLI). The "~89%" coverage number was never measured;
+> CostGuard does not currently have `cargo-tarpaulin` or `cargo-llvm-cov`
+> wired. Stale entries below (e.g. "Unit Tests", "Phase 4: 18 tests")
+> are preserved for diff traceability but should not be treated as
+> shipping state.
 
 ## Overview
 

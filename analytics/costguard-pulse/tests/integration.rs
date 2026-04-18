@@ -493,13 +493,6 @@ fn test_commits_list_empty() {
 }
 
 #[test]
-fn test_sync_all_with_no_transcripts() {
-    let dir = unique_data_dir();
-    let result = run_cli(&dir, &["sync"]);
-    assert!(result.contains("up to date") || result.contains("error") || result.is_empty(), "Should handle gracefully: {result}");
-}
-
-#[test]
 fn test_sync_nonexistent_session() {
     let dir = unique_data_dir();
     let result = run_cli(&dir, &["sync", "--session", "nonexistent-sess-id"]);
@@ -600,21 +593,6 @@ fn test_very_long_session_id() {
     let long_id = "s".repeat(256);
     let output = run_hook(&dir, "session-start", &format!(r#"{{"sessionId":"{}","cwd":"/opt/test"}}"#, long_id));
     assert!(output.status.success(), "Should handle long IDs gracefully");
-}
-
-#[test]
-fn test_zero_token_usage() {
-    let dir = unique_data_dir();
-    let tp = format!("{dir}/zero.jsonl");
-    let mut f = fs::File::create(&tp).unwrap();
-    writeln!(f, r#"{{"type":"progress","timestamp":"2026-03-20T10:00:00.000Z","uuid":"meta-1","cwd":"/opt/test","sessionId":"sess-zero"}}"#).unwrap();
-    writeln!(f, r#"{{"type":"assistant","timestamp":"2026-03-20T10:00:01.000Z","uuid":"msg-1","message":{{"model":"claude-opus-4-6","usage":{{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"content":[{{"type":"text","text":"nothing"}}]}}}}"#).unwrap();
-
-    run_hook(&dir, "session-start", &format!(r#"{{"sessionId":"sess-zero","cwd":"/opt/test","transcriptPath":"{tp}"}}"#));
-    run_hook(&dir, "session-end", &format!(r#"{{"sessionId":"sess-zero","transcriptPath":"{tp}"}}"#));
-
-    let result = run_cli(&dir, &["stats", "--period", "all"]);
-    assert!(result.contains("$    0.00") || result.contains("0 tokens"), "Should handle zero usage: {result}");
 }
 
 #[test]

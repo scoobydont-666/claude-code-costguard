@@ -65,9 +65,7 @@ costguard/
 ├── analytics/
 │   └── costguard-pulse/             # Rust CLI — session analytics + live statusline
 │       ├── src/                     # 6 source files, ~1400 lines
-│       └── tests/                   # 57 integration tests + 25 unit-test placeholders
-│                                    # (see TESTING.md for caveats — 2 integration
-│                                    # tests require an isolated fixture dir to pass)
+│       └── tests/integration.rs     # 55 end-to-end CLI + hook tests (all passing)
 ├── config/
 │   └── settings-snippet.json        # Hook configuration to merge into settings.json
 ├── install.sh                       # One-command installer

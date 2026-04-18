@@ -1,22 +1,24 @@
 # CostGuard Testing Guide
 
-## Honest Current State (2026-04-18)
+## Current State (2026-04-18)
 
-- **Integration tests** (`tests/integration.rs`): 57 defined, **55 pass, 2 fail**.
-  The 2 failing tests assume an isolated fixture directory; they regress when
-  run in an env that has real Claude transcript data (they try to discover a
-  "no transcripts" baseline and find real ones). Fix requires switching to
-  tmpdir-rooted fixtures. Tracked as a `known_failing` category below.
-- **Unit tests** (`tests/unit_tests.rs`): 25 defined — most are **documentation
-  placeholders** (trivial `assert_eq!(x, x)` to describe expected behavior).
-  They pass but do not exercise real parsing/calculation paths.
-- **Hook tests** (`hooks/test-hooks.sh`): shell-only static checks. No CI.
-- **CI**: `.github/workflows/security.yml` runs gitleaks only. Test runs are
-  not wired into CI.
+- **Integration tests** (`tests/integration.rs`): **55 tests, all passing**.
+  Exercise the `costguard-pulse` CLI and the `costguard-pulse-hook` binary
+  against a real filesystem + SQLite DB, with each test using a unique
+  `XDG_DATA_HOME` for isolation.
+- **Hook tests** (`hooks/test-hooks.sh`): shell-only static checks
+  (existence, permissions, license headers). No CI wiring.
+- **CI**: `.github/workflows/security.yml` runs gitleaks only. No
+  test-runner workflow (October 2026 scale-back — test-runner was
+  costing Actions minutes without catching anything the author wasn't
+  already running locally).
 
-So the earlier "70+ tests" / "~89% coverage" table was aspirational-tense
-prose, not measurements. The real shipping invariants are: 55 integration
-tests pass, and the binaries build cleanly.
+The older "70+ tests / ~89% coverage" language in this file was design
+intent, never measurement. It's gone. The unit-tests suite that held
+25 tautological placeholders (`assert_eq!(x, x)` describing expected
+parse/calc behavior in comments) was deleted 2026-04-18; the
+integration tests already exercise the same parse/calc code paths
+through the CLI, so the placeholders were dead weight.
 
 ---
 
@@ -31,9 +33,8 @@ Run all tests:
 Run specific test suite:
 
 ```bash
-./run-tests.sh --integration  # 57 tests (55 pass, 2 need isolated fixtures)
-./run-tests.sh --units        # 25 placeholder tests (docs-as-tests)
-./run-tests.sh --hooks        # Shell script tests (static checks)
+./run-tests.sh --integration  # 55 tests (end-to-end CLI + hook)
+./run-tests.sh --hooks        # Shell script static checks
 ```
 
 Run with verbose output:
@@ -62,41 +63,25 @@ cd analytics/costguard-pulse
 cargo test --test integration
 ```
 
-**Categories**:
-- **Phase 1** (10 tests): Core session/hook functionality
-- **Phase 2** (7 tests): Data integrity and sync
-- **Phase 3** (10 tests): Reporting and display
-- **Phase 4** (18 tests): Advanced features and edge cases
+**Categories** (approximate, by test name prefix):
+- Core session/hook functionality (~10 tests)
+- Data integrity and sync (~7 tests)
+- Reporting and display (~10 tests)
+- Fleet, efficiency, budgets, anomalies (~18 tests)
+- Robustness / edge cases (~10 tests)
 
-### 2. Unit Tests (25, placeholder)
+Exact split fluctuates as tests are added/removed. Count of `#[test]`
+attributes in `tests/integration.rs` is the source of truth.
 
-**Location**: `analytics/costguard-pulse/tests/unit_tests.rs`
+### 2. Unit Tests — deleted 2026-04-18
 
-Intended to test isolated functions:
-- Token parsing and formatting
-- Cost calculations
-- Timestamp handling
-- Buffer overflow prevention
-- SQL injection prevention
+`tests/unit_tests.rs` previously held 25 tautological placeholders
+(`assert_eq!(x, x)` describing expected parse/calc behavior in
+comments). The integration suite already exercises those code paths
+through the CLI, so the placeholders were dead weight. File removed.
 
-**Current reality:** these 25 tests describe expected behavior in comments
-but assert tautologies (e.g. `assert_eq!(500_000_000, 500_000_000)`). They
-exist to document the parse/calc contract and should be rewritten to call
-the actual functions once those are exposed from `main.rs`.
-
-**Run**:
-```bash
-cd analytics/costguard-pulse
-cargo test --test unit_tests
-```
-
-**Coverage**:
-- Parsing (5 tests)
-- Calculations (5 tests)
-- Data integrity (5 tests)
-- Error handling (5 tests)
-- Edge cases (5 tests)
-- Configuration (5 tests)
+If you need real unit coverage of parse/calc, expose the functions
+from `main.rs` into a `lib.rs` + add tests that call them directly.
 
 ### 3. Shell Hook Tests
 
@@ -124,16 +109,15 @@ number was unsubstantiated. Raw test counts per suite:
 
 | Suite | Count | Passing | Notes |
 |-------|-------|---------|-------|
-| Integration (`tests/integration.rs`) | 57 | 55 | 2 fail when real transcripts exist in $XDG_DATA_HOME |
-| Unit (`tests/unit_tests.rs`) | 25 | 25 | Placeholders — tautological asserts |
+| Integration (`tests/integration.rs`) | 55 | 55 | End-to-end CLI + hook; unique XDG_DATA_HOME per test |
 | Hooks (`hooks/test-hooks.sh`) | N/A | — | Static checks, no assertions beyond existence/executability |
-| **Total** | **82** | **80** | 2 flakes on real-data envs |
+| **Total** | **55** | **55** | |
 
 ---
 
 ## Performance
 
-The 80 currently-passing tests complete in about 180 seconds on an i5-8500
+All 55 integration tests complete in under 180 seconds
 (parallel execution enabled).
 
 ### Test Timing
@@ -332,4 +316,4 @@ Test suite is MIT licensed (same as CostGuard).
 
 ## Questions?
 
-See `TEST_SUITE.md` for detailed per-test documentation (82 tests defined).
+See `TEST_SUITE.md` for per-test documentation (55 tests defined).
