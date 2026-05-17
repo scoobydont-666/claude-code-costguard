@@ -1,0 +1,95 @@
+schema_version: "1.0.0"
+contract_id: scoobydont-666-claude-code-costguard
+repo: scoobydont-666/claude-code-costguard
+contract_version: "0.1.0"
+status: active
+maturity: alpha
+description: >
+  Claude Code session cost tracking + budget enforcement. Parses JSONL transcripts, accumulates token costs per session/project, emits alerts on budget threshold breach.
+entities:
+  - id: service-costguard
+    kind: service
+    name: Costguard
+    qualified_name: costguard.cli
+    file: src/costguard/cli.py
+    confidence: 1.0
+    description: Main service entry point for cost tracking and budget enforcement.
+    tags:
+      - cost-tracking
+      - budget
+      - cli
+    valid_from: "2026-05-17"
+    valid_until: null
+  - id: module-transcript-parser
+    kind: module
+    name: Transcript Parser
+    qualified_name: costguard.parser
+    file: src/costguard/parser.py
+    confidence: 1.0
+    description: Parses JSONL transcripts to extract token usage data.
+    tags:
+      - jsonl
+      - parser
+      - token
+    valid_from: "2026-05-17"
+    valid_until: null
+  - id: module-budget-engine
+    kind: module
+    name: Budget Engine
+    qualified_name: costguard.budget
+    file: src/costguard/budget.py
+    confidence: 1.0
+    description: Manages budget thresholds and cost accumulation per session/project.
+    tags:
+      - budget
+      - cost-accumulation
+      - threshold
+    valid_from: "2026-05-17"
+    valid_until: null
+  - id: module-alert-emitter
+    kind: module
+    name: Alert Emitter
+    qualified_name: costguard.alert
+    file: src/costguard/alert.py
+    confidence: 1.0
+    description: Emits alerts when budget thresholds are breached.
+    tags:
+      - alert
+      - notification
+      - budget
+    valid_from: "2026-05-17"
+    valid_until: null
+  - id: table-session-costs
+    kind: table
+    name: Session Costs
+    qualified_name: costguard.sqlite
+    file: data/costguard.db
+    confidence: 1.0
+    description: Stores accumulated session costs in a SQLite database.
+    tags:
+      - sqlite
+      - cost-tracking
+      - database
+    valid_from: "2026-05-17"
+    valid_until: null
+relations:
+  - id: rel-svc-owns-parser
+    from: service-costguard
+    to: module-transcript-parser
+    type: owns
+    confidence: 1.0
+  - id: rel-svc-owns-budget
+    from: service-costguard
+    to: module-budget-engine
+    type: owns
+    confidence: 1.0
+  - id: rel-budget-calls-alert
+    from: module-budget-engine
+    to: module-alert-emitter
+    type: calls
+    confidence: 1.0
+  - id: rel-svc-writes-costs
+    from: service-costguard
+    to: table-session-costs
+    type: writes_to
+    confidence: 1.0
